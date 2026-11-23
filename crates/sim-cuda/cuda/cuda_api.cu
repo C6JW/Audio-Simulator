@@ -28,7 +28,9 @@ extern __global__ void k_compute_slow_forces(FluidLevelGpu lvl, FluidConstantsGp
 
 extern __global__ void k_amr_reset_fluxes(FluidLevelGpu child);
 extern __global__ void k_amr_fill_ghost_cells(FluidLevelGpu child, FluidLevelGpu parent, double theta_time, int fill_alpha);
+extern __global__ void k_amr_fill_ghost_cells_slab(FluidLevelGpu child, FluidLevelGpu parent, float t_f, int fill_alpha, int axis);
 extern __global__ void k_amr_fill_ghost_faces(FluidLevelGpu child, FluidLevelGpu parent, float theta_time);
+extern __global__ void k_amr_fill_ghost_faces_slab(FluidLevelGpu child, FluidLevelGpu parent, float theta_time, int axis);
 extern __global__ void k_amr_reflux_pressure(FluidLevelGpu child, FluidLevelGpu parent, FluidConstantsGpu c, float dt_parent);
 extern __global__ void k_amr_restrict_cells(FluidLevelGpu child, FluidLevelGpu parent, FluidConstantsGpu c);
 extern __global__ void k_amr_restrict_faces(FluidLevelGpu child, FluidLevelGpu parent, FluidConstantsGpu c);
@@ -130,6 +132,7 @@ extern __global__ void k_euler_apply_wind_inlet_bbox(
     float vx, float vy, float vz, float turb_amp, float t_now, float relax
 );
 extern __global__ void k_euler_amr_fill_ghosts(FluidLevelGpu child, FluidLevelGpu parent, int32_t target_stage);
+extern __global__ void k_euler_amr_fill_ghosts_slab(FluidLevelGpu child, FluidLevelGpu parent, int32_t target_stage, int32_t axis);
 extern __global__ void k_euler_amr_restrict(FluidLevelGpu child, FluidLevelGpu parent);
 extern __global__ void k_euler_shift_x_stage1(FluidLevelGpu patch, int32_t shift_cells);
 extern __global__ void k_euler_shift_x_stage2(FluidLevelGpu patch, FluidLevelGpu parent, int32_t shift_cells);
@@ -273,15 +276,20 @@ static __global__ void k_apply_directional_source_bbox(
     }
 }
 
-static __global__ void k_apply_point_source_ricker(
-    FluidLevelGpu lvl, float cx, float cy, float cz, float radius, float rate_pa_per_s
+static __global__ void k_apply_point_source_ricker_bbox(
+    FluidLevelGpu lvl,
+    int i_lo, int j_lo, int k_lo, int bx, int by, int bz,
+    float cx, float cy, float cz, float radius, float rate_pa_per_s
 ) {
-    int h = lvl.halo;
-    int i = h + blockIdx.x * blockDim.x + threadIdx.x;
-    int j = h + blockIdx.y * blockDim.y + threadIdx.y;
-    int k = h + blockIdx.z * blockDim.z + threadIdx.z;
-    if (i >= h + lvl.nx || j >= h + lvl.ny || k >= h + lvl.nz) return;
+    int ti = blockIdx.x * blockDim.x + threadIdx.x;
+    int tj = blockIdx.y * blockDim.y + threadIdx.y;
+    int tk = blockIdx.z * blockDim.z + threadIdx.z;
+    if (ti >= bx || tj >= by || tk >= bz || lvl.src_p == nullptr) return;
 
+    int h = lvl.halo;
+    int i = i_lo + ti;
+    int j = j_lo + tj;
+    int k = k_lo + tk;
     float x = lvl.ox + ((float)(i - h) + 0.5f) * lvl.dx;
     float y = lvl.oy + ((float)(j - h) + 0.5f) * lvl.dx;
     float z = lvl.oz + ((float)(k - h) + 0.5f) * lvl.dx;
@@ -290,14 +298,9 @@ static __global__ void k_apply_point_source_ricker(
     float dz = z - cz;
     float r2 = dx * dx + dy * dy + dz * dz;
     float s2 = radius * radius;
-    size_t cid = idx_cell(i, j, k, lvl.nxp, lvl.nyp);
-    if (lvl.src_p != nullptr) {
-        if (r2 < 9.0f * s2) {
-            float w = expf(-0.5f * r2 / s2);
-            lvl.src_p[cid] = rate_pa_per_s * w;
-        } else {
-            lvl.src_p[cid] = 0.0f;
-        }
+    if (r2 < 9.0f * s2) {
+        size_t cid = idx_cell(i, j, k, lvl.nxp, lvl.nyp);
+        lvl.src_p[cid] = rate_pa_per_s * expf(-0.5f * r2 / s2);
     }
 }
 
@@ -590,10 +593,29 @@ int32_t sim_fluid_inject_gaussian_pulse(
 int32_t sim_fluid_set_point_source_ricker(
     FluidLevelGpu lvl, float cx, float cy, float cz, float radius, float rate_pa_per_s, void* stream
 ) {
+    if (lvl.src_p == nullptr) return 0;
     cudaStream_t s = (cudaStream_t)stream;
+    size_t n_cells = (size_t)lvl.nxp * (size_t)lvl.nyp * (size_t)lvl.nzp;
+    cudaError_t err = cudaMemsetAsync(lvl.src_p, 0, n_cells * sizeof(float), s);
+    if (err != cudaSuccess) return (int32_t)err;
+    if (fabsf(rate_pa_per_s) <= 0.0f) return 0;
+
+    float span = 3.5f * radius + lvl.dx;
+    int h = lvl.halo;
+    int i_lo = max(h, (int)floorf((cx - span - lvl.ox) / lvl.dx) + h);
+    int i_hi = min(h + lvl.nx - 1, (int)ceilf((cx + span - lvl.ox) / lvl.dx) + h);
+    int j_lo = max(h, (int)floorf((cy - span - lvl.oy) / lvl.dx) + h);
+    int j_hi = min(h + lvl.ny - 1, (int)ceilf((cy + span - lvl.oy) / lvl.dx) + h);
+    int k_lo = max(h, (int)floorf((cz - span - lvl.oz) / lvl.dx) + h);
+    int k_hi = min(h + lvl.nz - 1, (int)ceilf((cz + span - lvl.oz) / lvl.dx) + h);
+    if (i_lo > i_hi || j_lo > j_hi || k_lo > k_hi) return 0;
+
+    int bx = i_hi - i_lo + 1;
+    int by = j_hi - j_lo + 1;
+    int bz = k_hi - k_lo + 1;
     dim3 b(8, 8, 4);
-    k_apply_point_source_ricker<<<grid3(lvl.nx, lvl.ny, lvl.nz, b), b, 0, s>>>(
-        lvl, cx, cy, cz, radius, rate_pa_per_s
+    k_apply_point_source_ricker_bbox<<<grid3(bx, by, bz, b), b, 0, s>>>(
+        lvl, i_lo, j_lo, k_lo, bx, by, bz, cx, cy, cz, radius, rate_pa_per_s
     );
     return (int32_t)cudaGetLastError();
 }
@@ -635,8 +657,13 @@ int32_t sim_fluid_apply_directional_source_bbox(
 
 static inline void launch_outer_bc_slabs(FluidLevelGpu lvl, cudaStream_t s) {
     if (lvl.level_idx != 0) return;
-    dim3 b(8, 8, 4);
-    k_outer_bc_all<<<grid3(lvl.nxp + 1, lvl.nyp + 1, lvl.nzp + 1, b), b, 0, s>>>(lvl);
+    int h2 = 2 * lvl.halo;
+    dim3 bx(2, 16, 8);
+    k_outer_bc_slab_x<<<grid3(h2, lvl.nyp, lvl.nzp, bx), bx, 0, s>>>(lvl);
+    dim3 by(16, 2, 8);
+    k_outer_bc_slab_y<<<grid3(lvl.nxp, h2, lvl.nzp, by), by, 0, s>>>(lvl);
+    dim3 bz(16, 8, 2);
+    k_outer_bc_slab_z<<<grid3(lvl.nxp, lvl.nyp, h2, bz), bz, 0, s>>>(lvl);
 }
 
 int32_t sim_fluid_save_old(FluidLevelGpu lvl, void* stream) {
@@ -692,6 +719,9 @@ int32_t sim_fluid_flow_step(
         k_vof_copy_tmp_and_bc<<<grid3(lvl.nxp, lvl.nyp, lvl.nzp, b), b, 0, s>>>(lvl);
     }
 
+    // Kapila mechanical pressure-equilibrium volume-fraction relaxation (compressible bubble breathing)
+    k_vof_kapila_finalize<<<grid3(lvl.nx, lvl.ny, lvl.nz, b), b, 0, s>>>(lvl, c, dt_flow);
+
     k_mflux_ghost_bc<<<grid3(lvl.nxp + 1, lvl.nyp + 1, lvl.nzp + 1, b), b, 0, s>>>(lvl);
     k_advect_momentum<<<grid3(lvl.nx + 1, lvl.ny + 1, lvl.nz + 1, b), b, 0, s>>>(lvl, c);
     k_copy_vflux_to_u<<<grid3(lvl.nx + 1, lvl.ny + 1, lvl.nz + 1, b), b, 0, s>>>(lvl);
@@ -743,13 +773,24 @@ int32_t sim_fluid_amr_fill_ghosts(
     FluidLevelGpu child, FluidLevelGpu parent, double theta_time, int32_t fill_alpha, void* stream
 ) {
     cudaStream_t s = (cudaStream_t)stream;
-    dim3 b(8, 8, 4);
-    k_amr_fill_ghost_cells<<<grid3(child.nxp, child.nyp, child.nzp, b), b, 0, s>>>(
-        child, parent, theta_time, fill_alpha
-    );
-    k_amr_fill_ghost_faces<<<grid3(child.nxp + 1, child.nyp + 1, child.nzp + 1, b), b, 0, s>>>(
-        child, parent, (float)theta_time
-    );
+    int hc = child.halo;
+    int h2 = 2 * hc;
+    int hf2 = 2 * (hc + 1);
+    float tf = (float)theta_time;
+
+    // 3 disjoint boundary slabs for ghost cells (skips interior nx*ny*nz)
+    dim3 bcx(2, 16, 8);
+    k_amr_fill_ghost_cells_slab<<<grid3(h2, child.nyp, child.nzp, bcx), bcx, 0, s>>>(child, parent, tf, fill_alpha, 0);
+    dim3 bcy(16, 2, 8);
+    k_amr_fill_ghost_cells_slab<<<grid3(child.nx, h2, child.nzp, bcy), bcy, 0, s>>>(child, parent, tf, fill_alpha, 1);
+    dim3 bcz(16, 8, 2);
+    k_amr_fill_ghost_cells_slab<<<grid3(child.nx, child.ny, h2, bcz), bcz, 0, s>>>(child, parent, tf, fill_alpha, 2);
+
+    // 3 disjoint boundary slabs for ghost faces (includes patch-boundary faces)
+    k_amr_fill_ghost_faces_slab<<<grid3(hf2, child.nyp + 1, child.nzp + 1, bcx), bcx, 0, s>>>(child, parent, tf, 0);
+    k_amr_fill_ghost_faces_slab<<<grid3(child.nx, hf2, child.nzp + 1, bcy), bcy, 0, s>>>(child, parent, tf, 1);
+    k_amr_fill_ghost_faces_slab<<<grid3(child.nx, child.ny, hf2, bcz), bcz, 0, s>>>(child, parent, tf, 2);
+
     return (int32_t)cudaGetLastError();
 }
 
@@ -1256,8 +1297,13 @@ int32_t sim_euler_apply_wind_inlet(
 
 int32_t sim_euler_amr_fill_ghosts(FluidLevelGpu child, FluidLevelGpu parent, int32_t target_stage, void* stream) {
     cudaStream_t s = (cudaStream_t)stream;
-    dim3 b(8, 8, 4);
-    k_euler_amr_fill_ghosts<<<grid3(child.nxp, child.nyp, child.nzp, b), b, 0, s>>>(child, parent, target_stage);
+    int h2 = 2 * child.halo;
+    dim3 bx(2, 16, 8);
+    k_euler_amr_fill_ghosts_slab<<<grid3(h2, child.nyp, child.nzp, bx), bx, 0, s>>>(child, parent, target_stage, 0);
+    dim3 by(16, 2, 8);
+    k_euler_amr_fill_ghosts_slab<<<grid3(child.nx, h2, child.nzp, by), by, 0, s>>>(child, parent, target_stage, 1);
+    dim3 bz(16, 8, 2);
+    k_euler_amr_fill_ghosts_slab<<<grid3(child.nx, child.ny, h2, bz), bz, 0, s>>>(child, parent, target_stage, 2);
     return (int32_t)cudaGetLastError();
 }
 

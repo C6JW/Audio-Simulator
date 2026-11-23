@@ -109,6 +109,179 @@ __global__ void k_amr_reset_fluxes(FluidLevelGpu child) {
     }
 }
 
+__device__ __forceinline__ void fill_ghost_cell_one(
+    const FluidLevelGpu& child,
+    const FluidLevelGpu& parent,
+    float t_f,
+    int fill_alpha,
+    int i, int j, int k
+) {
+    int h = child.halo;
+    float x = child.ox + ((float)(i - h) + 0.5f) * child.dx;
+    float y = child.oy + ((float)(j - h) + 0.5f) * child.dx;
+    float z = child.oz + ((float)(k - h) + 0.5f) * child.dx;
+
+    float fx = (x - parent.ox) / parent.dx - 0.5f + (float)parent.halo;
+    float fy = (y - parent.oy) / parent.dx - 0.5f + (float)parent.halo;
+    float fz = (z - parent.oz) / parent.dx - 0.5f + (float)parent.halo;
+
+    float pac_new = trilinear_cell_float(parent.p_gauge, parent.nxp, parent.nyp, parent.nzp, fx, fy, fz);
+    float pac = pac_new;
+    if (parent.p_gauge_old != nullptr) {
+        float pac_old = trilinear_cell_float(parent.p_gauge_old, parent.nxp, parent.nyp, parent.nzp, fx, fy, fz);
+        pac = (1.0f - t_f) * pac_old + t_f * pac_new;
+    }
+
+    size_t cid = idx_cell(i, j, k, child.nxp, child.nyp);
+    child.p_gauge[cid] = pac;
+
+    if (fill_alpha) {
+        int ip = max(0, min(parent.nxp - 1, (int)floorf((x - parent.ox) / parent.dx) + parent.halo));
+        int jp = max(0, min(parent.nyp - 1, (int)floorf((y - parent.oy) / parent.dx) + parent.halo));
+        int kp = max(0, min(parent.nzp - 1, (int)floorf((z - parent.oz) / parent.dx) + parent.halo));
+        child.alpha[cid] = clamp_f(parent.alpha[idx_cell(ip, jp, kp, parent.nxp, parent.nyp)], 0.0f, 1.0f);
+    }
+}
+
+__device__ __forceinline__ float sample_parent_face_time(
+    const float* u_old,
+    const float* u_new,
+    int sx, int sy, int sz,
+    float fx, float fy, float fz,
+    int axis,
+    float w_new
+) {
+    float v_new = trilinear_face_float(u_new, sx, sy, sz, fx, fy, fz, axis);
+    if (u_old != nullptr && w_new < 0.9999f) {
+        float v_old = trilinear_face_float(u_old, sx, sy, sz, fx, fy, fz, axis);
+        return (1.0f - w_new) * v_old + w_new * v_new;
+    }
+    return v_new;
+}
+
+__device__ __forceinline__ void fill_ghost_ux_one(
+    const FluidLevelGpu& child, const FluidLevelGpu& parent, float w_new, int i, int j, int k
+) {
+    int h = child.halo;
+    float x = child.ox + (float)(i - h) * child.dx;
+    float y = child.oy + ((float)(j - h) + 0.5f) * child.dx;
+    float z = child.oz + ((float)(k - h) + 0.5f) * child.dx;
+    float fx = (x - parent.ox) / parent.dx + (float)parent.halo;
+    float fy = (y - parent.oy) / parent.dx - 0.5f + (float)parent.halo;
+    float fz = (z - parent.oz) / parent.dx - 0.5f + (float)parent.halo;
+    child.ux[idx_fx(i, j, k, child.nxp, child.nyp)] = sample_parent_face_time(
+        parent.ux_old, parent.ux, parent.nxp + 1, parent.nyp, parent.nzp, fx, fy, fz, 0, w_new
+    );
+}
+
+__device__ __forceinline__ void fill_ghost_uy_one(
+    const FluidLevelGpu& child, const FluidLevelGpu& parent, float w_new, int i, int j, int k
+) {
+    int h = child.halo;
+    float x = child.ox + ((float)(i - h) + 0.5f) * child.dx;
+    float y = child.oy + (float)(j - h) * child.dx;
+    float z = child.oz + ((float)(k - h) + 0.5f) * child.dx;
+    float fx = (x - parent.ox) / parent.dx - 0.5f + (float)parent.halo;
+    float fy = (y - parent.oy) / parent.dx + (float)parent.halo;
+    float fz = (z - parent.oz) / parent.dx - 0.5f + (float)parent.halo;
+    child.uy[idx_fy(i, j, k, child.nxp, child.nyp)] = sample_parent_face_time(
+        parent.uy_old, parent.uy, parent.nxp, parent.nyp + 1, parent.nzp, fx, fy, fz, 1, w_new
+    );
+}
+
+__device__ __forceinline__ void fill_ghost_uz_one(
+    const FluidLevelGpu& child, const FluidLevelGpu& parent, float w_new, int i, int j, int k
+) {
+    int h = child.halo;
+    float x = child.ox + ((float)(i - h) + 0.5f) * child.dx;
+    float y = child.oy + ((float)(j - h) + 0.5f) * child.dx;
+    float z = child.oz + (float)(k - h) * child.dx;
+    float fx = (x - parent.ox) / parent.dx - 0.5f + (float)parent.halo;
+    float fy = (y - parent.oy) / parent.dx - 0.5f + (float)parent.halo;
+    float fz = (z - parent.oz) / parent.dx + (float)parent.halo;
+    child.uz[idx_fz(i, j, k, child.nxp, child.nyp)] = sample_parent_face_time(
+        parent.uz_old, parent.uz, parent.nxp, parent.nyp, parent.nzp + 1, fx, fy, fz, 2, w_new
+    );
+}
+
+__global__ void k_amr_fill_ghost_cells_slab(
+    FluidLevelGpu child,
+    FluidLevelGpu parent,
+    float t_f,
+    int fill_alpha,
+    int axis
+) {
+    int h = child.halo;
+    int tx = blockIdx.x * blockDim.x + threadIdx.x;
+    int ty = blockIdx.y * blockDim.y + threadIdx.y;
+    int tz = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (axis == 0) {
+        if (tx >= 2 * h || ty >= child.nyp || tz >= child.nzp) return;
+        int i = (tx < h) ? tx : (h + child.nx + (tx - h));
+        fill_ghost_cell_one(child, parent, t_f, fill_alpha, i, ty, tz);
+    } else if (axis == 1) {
+        if (tx >= child.nx || ty >= 2 * h || tz >= child.nzp) return;
+        int i = h + tx;
+        int j = (ty < h) ? ty : (h + child.ny + (ty - h));
+        fill_ghost_cell_one(child, parent, t_f, fill_alpha, i, j, tz);
+    } else {
+        if (tx >= child.nx || ty >= child.ny || tz >= 2 * h) return;
+        int i = h + tx;
+        int j = h + ty;
+        int k = (tz < h) ? tz : (h + child.nz + (tz - h));
+        fill_ghost_cell_one(child, parent, t_f, fill_alpha, i, j, k);
+    }
+}
+
+__global__ void k_amr_fill_ghost_faces_slab(
+    FluidLevelGpu child,
+    FluidLevelGpu parent,
+    float theta_time,
+    int axis
+) {
+    int h = child.halo;
+    // Parent velocities live at leapfrog half-steps t^{n-1/2} (old) and t^{n+1/2} (new).
+    // Map child substep time t^n + theta_time * dt_p onto [t^{n-1/2}, t^{n+1/2}] without extrapolating.
+    float w_new = clamp_f(0.5f + theta_time, 0.0f, 1.0f);
+    int tx = blockIdx.x * blockDim.x + threadIdx.x;
+    int ty = blockIdx.y * blockDim.y + threadIdx.y;
+    int tz = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (axis == 0) {
+        if (tx >= 2 * (h + 1) || ty > child.nyp || tz > child.nzp) return;
+        int i = (tx <= h) ? tx : (h + child.nx + (tx - (h + 1)));
+        if (ty < child.nyp && tz < child.nzp) {
+            fill_ghost_ux_one(child, parent, w_new, i, ty, tz);
+        }
+        if (i < h || (i >= h + child.nx && i < child.nxp)) {
+            if (tz < child.nzp) fill_ghost_uy_one(child, parent, w_new, i, ty, tz);
+            if (ty < child.nyp) fill_ghost_uz_one(child, parent, w_new, i, ty, tz);
+        }
+    } else if (axis == 1) {
+        if (tx >= child.nx || ty >= 2 * (h + 1) || tz > child.nzp) return;
+        int i = h + tx;
+        int j = (ty <= h) ? ty : (h + child.ny + (ty - (h + 1)));
+        if (tz < child.nzp) {
+            fill_ghost_uy_one(child, parent, w_new, i, j, tz);
+        }
+        if (j < h || (j >= h + child.ny && j < child.nyp)) {
+            if (i > h && tz < child.nzp) fill_ghost_ux_one(child, parent, w_new, i, j, tz);
+            fill_ghost_uz_one(child, parent, w_new, i, j, tz);
+        }
+    } else {
+        if (tx >= child.nx || ty >= child.ny || tz >= 2 * (h + 1)) return;
+        int i = h + tx;
+        int j = h + ty;
+        int k = (tz <= h) ? tz : (h + child.nz + (tz - (h + 1)));
+        fill_ghost_uz_one(child, parent, w_new, i, j, k);
+        if (k < h || (k >= h + child.nz && k < child.nzp)) {
+            if (i > h) fill_ghost_ux_one(child, parent, w_new, i, j, k);
+            if (j > h) fill_ghost_uy_one(child, parent, w_new, i, j, k);
+        }
+    }
+}
+
 __global__ void k_amr_fill_ghost_cells(
     FluidLevelGpu child,
     FluidLevelGpu parent,
@@ -124,29 +297,7 @@ __global__ void k_amr_fill_ghost_cells(
     if (i >= h && i < h + child.nx && j >= h && j < h + child.ny && k >= h && k < h + child.nz) {
         return;
     }
-
-    float x = child.ox + ((float)(i - h) + 0.5f) * child.dx;
-    float y = child.oy + ((float)(j - h) + 0.5f) * child.dx;
-    float z = child.oz + ((float)(k - h) + 0.5f) * child.dx;
-
-    float fx = (x - parent.ox) / parent.dx - 0.5f + (float)parent.halo;
-    float fy = (y - parent.oy) / parent.dx - 0.5f + (float)parent.halo;
-    float fz = (z - parent.oz) / parent.dx - 0.5f + (float)parent.halo;
-
-    float pac_old = trilinear_cell_float(parent.p_gauge_old, parent.nxp, parent.nyp, parent.nzp, fx, fy, fz);
-    float pac_new = trilinear_cell_float(parent.p_gauge, parent.nxp, parent.nyp, parent.nzp, fx, fy, fz);
-    float t_f = (float)theta_time;
-    float pac = (1.0f - t_f) * pac_old + t_f * pac_new;
-
-    size_t cid = idx_cell(i, j, k, child.nxp, child.nyp);
-    child.p_gauge[cid] = pac;
-
-    if (fill_alpha) {
-        int ip = max(0, min(parent.nxp - 1, (int)floorf((x - parent.ox) / parent.dx) + parent.halo));
-        int jp = max(0, min(parent.nyp - 1, (int)floorf((y - parent.oy) / parent.dx) + parent.halo));
-        int kp = max(0, min(parent.nzp - 1, (int)floorf((z - parent.oz) / parent.dx) + parent.halo));
-        child.alpha[cid] = clamp_f(parent.alpha[idx_cell(ip, jp, kp, parent.nxp, parent.nyp)], 0.0f, 1.0f);
-    }
+    fill_ghost_cell_one(child, parent, (float)theta_time, fill_alpha, i, j, k);
 }
 
 __global__ void k_amr_fill_ghost_faces(
@@ -158,49 +309,24 @@ __global__ void k_amr_fill_ghost_faces(
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     int k = blockIdx.z * blockDim.z + threadIdx.z;
     int h = child.halo;
+    float w_new = clamp_f(0.5f + theta_time, 0.0f, 1.0f);
 
-    // X-face ghosts & flux-matched patch boundary faces (strictly interior faces i in (h..h+nx))
     if (i <= child.nxp && j < child.nyp && k < child.nzp) {
         bool is_interior = (i > h && i < h + child.nx && j >= h && j < h + child.ny && k >= h && k < h + child.nz);
         if (!is_interior) {
-            float x = child.ox + (float)(i - h) * child.dx;
-            float y = child.oy + ((float)(j - h) + 0.5f) * child.dx;
-            float z = child.oz + ((float)(k - h) + 0.5f) * child.dx;
-            float fx = (x - parent.ox) / parent.dx + (float)parent.halo;
-            float fy = (y - parent.oy) / parent.dx - 0.5f + (float)parent.halo;
-            float fz = (z - parent.oz) / parent.dx - 0.5f + (float)parent.halo;
-            float u_mid = trilinear_face_float(parent.ux, parent.nxp + 1, parent.nyp, parent.nzp, fx, fy, fz, 0);
-            child.ux[idx_fx(i, j, k, child.nxp, child.nyp)] = u_mid;
+            fill_ghost_ux_one(child, parent, w_new, i, j, k);
         }
     }
-
-    // Y-face ghosts & flux-matched patch boundary faces
     if (i < child.nxp && j <= child.nyp && k < child.nzp) {
         bool is_interior = (i >= h && i < h + child.nx && j > h && j < h + child.ny && k >= h && k < h + child.nz);
         if (!is_interior) {
-            float x = child.ox + ((float)(i - h) + 0.5f) * child.dx;
-            float y = child.oy + (float)(j - h) * child.dx;
-            float z = child.oz + ((float)(k - h) + 0.5f) * child.dx;
-            float fx = (x - parent.ox) / parent.dx - 0.5f + (float)parent.halo;
-            float fy = (y - parent.oy) / parent.dx + (float)parent.halo;
-            float fz = (z - parent.oz) / parent.dx - 0.5f + (float)parent.halo;
-            float v_mid = trilinear_face_float(parent.uy, parent.nxp, parent.nyp + 1, parent.nzp, fx, fy, fz, 1);
-            child.uy[idx_fy(i, j, k, child.nxp, child.nyp)] = v_mid;
+            fill_ghost_uy_one(child, parent, w_new, i, j, k);
         }
     }
-
-    // Z-face ghosts & flux-matched patch boundary faces
     if (i < child.nxp && j < child.nyp && k <= child.nzp) {
         bool is_interior = (i >= h && i < h + child.nx && j >= h && j < h + child.ny && k > h && k < h + child.nz);
         if (!is_interior) {
-            float x = child.ox + ((float)(i - h) + 0.5f) * child.dx;
-            float y = child.oy + ((float)(j - h) + 0.5f) * child.dx;
-            float z = child.oz + (float)(k - h) * child.dx;
-            float fx = (x - parent.ox) / parent.dx - 0.5f + (float)parent.halo;
-            float fy = (y - parent.oy) / parent.dx - 0.5f + (float)parent.halo;
-            float fz = (z - parent.oz) / parent.dx + (float)parent.halo;
-            float w_mid = trilinear_face_float(parent.uz, parent.nxp, parent.nyp, parent.nzp + 1, fx, fy, fz, 2);
-            child.uz[idx_fz(i, j, k, child.nxp, child.nyp)] = w_mid;
+            fill_ghost_uz_one(child, parent, w_new, i, j, k);
         }
     }
 }
@@ -425,6 +551,9 @@ __global__ void k_amr_restrict_faces(
     int b = blockIdx.y * blockDim.y + threadIdx.y;
     int k_c = blockIdx.z * blockDim.z + threadIdx.z;
 
+    float rho_a = (float)c.rho_a;
+    float d_rho = (float)(c.rho_w - c.rho_a);
+
     // Strictly interior X-faces (a in 1..nx_c)
     if (a >= 1 && a < nx_c && b < ny_c && k_c < nz_c) {
         int ic = parent.halo + child.off_x + a;
@@ -434,21 +563,21 @@ __global__ void k_amr_restrict_faces(
         int jf_b = child.halo + b * r;
         int kf_b = child.halo + k_c * r;
 
-        double mom_sum = 0.0;
-        double rho_sum = 0.0;
+        float mom_sum = 0.0f;
+        float rho_sum = 0.0f;
         for (int dk = 0; dk < r; ++dk) {
             for (int dj = 0; dj < r; ++dj) {
                 int jf = jf_b + dj;
                 int kf = kf_b + dk;
-                double aL = (double)child.alpha[idx_cell(if_b - 1, jf, kf, child.nxp, child.nyp)];
-                double aR = (double)child.alpha[idx_cell(if_b, jf, kf, child.nxp, child.nyp)];
-                double rho_f = 0.5 * (mix_density(aL, c) + mix_density(aR, c));
-                double uf = (double)child.ux[idx_fx(if_b, jf, kf, child.nxp, child.nyp)];
+                float aL = clamp_f(child.alpha[idx_cell(if_b - 1, jf, kf, child.nxp, child.nyp)], 0.0f, 1.0f);
+                float aR = clamp_f(child.alpha[idx_cell(if_b, jf, kf, child.nxp, child.nyp)], 0.0f, 1.0f);
+                float rho_f = rho_a + 0.5f * (aL + aR) * d_rho;
+                float uf = child.ux[idx_fx(if_b, jf, kf, child.nxp, child.nyp)];
                 mom_sum += rho_f * uf;
                 rho_sum += rho_f;
             }
         }
-        parent.ux[idx_fx(ic, jc, kc, parent.nxp, parent.nyp)] = (float)(mom_sum / rho_sum);
+        parent.ux[idx_fx(ic, jc, kc, parent.nxp, parent.nyp)] = mom_sum / rho_sum;
     }
 
     // Strictly interior Y-faces (b in 1..ny_c)
@@ -460,21 +589,21 @@ __global__ void k_amr_restrict_faces(
         int jf_b = child.halo + b * r;
         int kf_b = child.halo + k_c * r;
 
-        double mom_sum = 0.0;
-        double rho_sum = 0.0;
+        float mom_sum = 0.0f;
+        float rho_sum = 0.0f;
         for (int dk = 0; dk < r; ++dk) {
             for (int di = 0; di < r; ++di) {
                 int if_ = if_b + di;
                 int kf = kf_b + dk;
-                double aL = (double)child.alpha[idx_cell(if_, jf_b - 1, kf, child.nxp, child.nyp)];
-                double aR = (double)child.alpha[idx_cell(if_, jf_b, kf, child.nxp, child.nyp)];
-                double rho_f = 0.5 * (mix_density(aL, c) + mix_density(aR, c));
-                double vf = (double)child.uy[idx_fy(if_, jf_b, kf, child.nxp, child.nyp)];
+                float aL = clamp_f(child.alpha[idx_cell(if_, jf_b - 1, kf, child.nxp, child.nyp)], 0.0f, 1.0f);
+                float aR = clamp_f(child.alpha[idx_cell(if_, jf_b, kf, child.nxp, child.nyp)], 0.0f, 1.0f);
+                float rho_f = rho_a + 0.5f * (aL + aR) * d_rho;
+                float vf = child.uy[idx_fy(if_, jf_b, kf, child.nxp, child.nyp)];
                 mom_sum += rho_f * vf;
                 rho_sum += rho_f;
             }
         }
-        parent.uy[idx_fy(ic, jc, kc, parent.nxp, parent.nyp)] = (float)(mom_sum / rho_sum);
+        parent.uy[idx_fy(ic, jc, kc, parent.nxp, parent.nyp)] = mom_sum / rho_sum;
     }
 
     // Strictly interior Z-faces (k_c in 1..nz_c)
@@ -486,20 +615,20 @@ __global__ void k_amr_restrict_faces(
         int jf_b = child.halo + b * r;
         int kf_b = child.halo + k_c * r;
 
-        double mom_sum = 0.0;
-        double rho_sum = 0.0;
+        float mom_sum = 0.0f;
+        float rho_sum = 0.0f;
         for (int dj = 0; dj < r; ++dj) {
             for (int di = 0; di < r; ++di) {
                 int if_ = if_b + di;
                 int jf = jf_b + dj;
-                double aL = (double)child.alpha[idx_cell(if_, jf, kf_b - 1, child.nxp, child.nyp)];
-                double aR = (double)child.alpha[idx_cell(if_, jf, kf_b, child.nxp, child.nyp)];
-                double rho_f = 0.5 * (mix_density(aL, c) + mix_density(aR, c));
-                double wf = (double)child.uz[idx_fz(if_, jf, kf_b, child.nxp, child.nyp)];
+                float aL = clamp_f(child.alpha[idx_cell(if_, jf, kf_b - 1, child.nxp, child.nyp)], 0.0f, 1.0f);
+                float aR = clamp_f(child.alpha[idx_cell(if_, jf, kf_b, child.nxp, child.nyp)], 0.0f, 1.0f);
+                float rho_f = rho_a + 0.5f * (aL + aR) * d_rho;
+                float wf = child.uz[idx_fz(if_, jf, kf_b, child.nxp, child.nyp)];
                 mom_sum += rho_f * wf;
                 rho_sum += rho_f;
             }
         }
-        parent.uz[idx_fz(ic, jc, kc, parent.nxp, parent.nyp)] = (float)(mom_sum / rho_sum);
+        parent.uz[idx_fz(ic, jc, kc, parent.nxp, parent.nyp)] = mom_sum / rho_sum;
     }
 }

@@ -459,15 +459,20 @@ __global__ void k_ib_gather_fluid_to_solid(
 
     float rho_local = 0.5f * (mix_density_f(a_plus, c) + mix_density_f(a_minus, c));
     pts.fluid_rho[p] = rho_local;
-    float m_eff = pts.mass[p] + rho_local * pts.area[p] * fmaxf(0.0f, pts.hyd_len[p]);
+    float m0 = fmaxf(1e-18f, pts.mass[p]);
+    float m_add = rho_local * pts.area[p] * fmaxf(0.0f, pts.hyd_len[p]);
+    float m_eff = m0 + m_add;
 
     if (pflag & 8u) {
-        float rho_excess = fmaxf(0.0f, rho_local - 2.0f * (float)c.rho_a);
-        float w_p = 1.0f / (1.0f + 0.5f * (rho_excess / (float)c.rho_a));
+        // Partitioned explicit fluid-shell passivity factor:
+        // accounts for radiation impedance over the acoustic transit + coupling window tau_c
+        // and prevents double-counting added mass already integrated in d_shell_integrate_particle_one.
         float k_local = 0.5f * (mix_bulk_modulus_f(a_plus, p_plus + ph_plus, c) + mix_bulk_modulus_f(a_minus, p_minus + ph_minus, c));
         float z_local = sqrtf(fmaxf(1.0f, k_local * rho_local));
-        float w_imp = m_eff / (m_eff + 2.0f * z_local * pts.area[p] * fmaxf(0.0f, dt_ac));
-        force_mag *= w_p * w_imp;
+        float c_local = sqrtf(fmaxf(1.0f, k_local / fmaxf(1e-3f, rho_local)));
+        float tau_c = fmaxf(0.0f, dt_ac) + 2.0f * h_samp / c_local;
+        float w_imp = m0 / (m0 + 4.0f * z_local * pts.area[p] * tau_c + 4.0f * m_add);
+        force_mag *= w_imp;
     }
 
     // Physical dynamic form-drag exchange from impacting fluid jets / winds outside the IB band

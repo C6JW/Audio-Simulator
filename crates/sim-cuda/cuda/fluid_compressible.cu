@@ -195,6 +195,147 @@ __device__ __forceinline__ void hllc_flux_1d(
     }
 }
 
+__device__ __forceinline__ float van_leer(float a, float b) {
+    float ab = a * b;
+    float d = a + b;
+    return (ab > 0.0f && d != 0.0f) ? (2.0f * ab / d) : 0.0f;
+}
+
+__device__ __forceinline__ int tile_idx(int lx, int ly, int lz) {
+    return (lz * 12 + ly) * 12 + lx;
+}
+
+__device__ __forceinline__ void eval_face_flux_tile(
+    const FluidLevelGpu& lvl, const FluidConstantsGpu& c,
+    const float* __restrict__ s_rho,
+    const float* __restrict__ s_u,
+    const float* __restrict__ s_v,
+    const float* __restrict__ s_w,
+    const float* __restrict__ s_p,
+    const float* __restrict__ s_ib,
+    float gamma,
+    int i, int j, int k,
+    int lx, int ly, int lz,
+    int axis,
+    float& out_rho, float& out_mx, float& out_my, float& out_mz, float& out_ene
+) {
+    int di = (axis == 0) ? 1 : 0;
+    int dj = (axis == 1) ? 1 : 0;
+    int dk = (axis == 2) ? 1 : 0;
+
+    int tL = tile_idx(lx - di, ly - dj, lz - dk);
+    int tR = tile_idx(lx,      ly,      lz);
+
+    float ibL = s_ib[tL];
+    float ibR = s_ib[tR];
+    if (ibL >= 0.5f && ibR >= 0.5f) {
+        out_rho = 0.0f; out_mx = 0.0f; out_my = 0.0f; out_mz = 0.0f; out_ene = 0.0f;
+        return;
+    }
+
+    float r1 = s_rho[tL], u1 = s_u[tL], v1 = s_v[tL], w1 = s_w[tL], p1 = s_p[tL];
+    float r2 = s_rho[tR], u2 = s_u[tR], v2 = s_v[tR], w2 = s_w[tR], p2 = s_p[tR];
+
+    // Handle solid-fluid IB wall interface
+    if (ibR >= 0.5f) {
+        size_t cR = idx_cell(i, j, k, lvl.nxp, lvl.nyp);
+        float vw_x = (lvl.cell_vx != nullptr) ? lvl.cell_vx[cR] : 0.0f;
+        float vw_y = (lvl.cell_vy != nullptr) ? lvl.cell_vy[cR] : 0.0f;
+        float vw_z = (lvl.cell_vz != nullptr) ? lvl.cell_vz[cR] : 0.0f;
+        float c1 = sqrtf(gamma * p1 / r1);
+        float vw_n = clamp_f((axis == 0) ? vw_x : ((axis == 1) ? vw_y : vw_z), -0.5f * c1, 0.5f * c1);
+        float q1 = (axis == 0) ? u1 : ((axis == 1) ? v1 : w1);
+        float rhs_rho, rhs_p;
+        hs_state(cell_z_world(lvl, k - dk), c, rhs_rho, rhs_p);
+        float q_imp = clamp_f(c.wall_admittance * (p1 - rhs_p) / (r1 * c1), -0.25f * c1, 0.25f * c1);
+        float q2 = 2.0f * vw_n - q1 + 2.0f * q_imp;
+        r2 = r1; p2 = p1;
+        u2 = (axis == 0) ? q2 : u1;
+        v2 = (axis == 1) ? q2 : v1;
+        w2 = (axis == 2) ? q2 : w1;
+        hllc_flux_1d(r1, u1, v1, w1, p1, r2, u2, v2, w2, p2, axis, gamma,
+                     out_rho, out_mx, out_my, out_mz, out_ene);
+        return;
+    }
+    if (ibL >= 0.5f) {
+        size_t cL = idx_cell(i - di, j - dj, k - dk, lvl.nxp, lvl.nyp);
+        float vw_x = (lvl.cell_vx != nullptr) ? lvl.cell_vx[cL] : 0.0f;
+        float vw_y = (lvl.cell_vy != nullptr) ? lvl.cell_vy[cL] : 0.0f;
+        float vw_z = (lvl.cell_vz != nullptr) ? lvl.cell_vz[cL] : 0.0f;
+        float c2 = sqrtf(gamma * p2 / r2);
+        float vw_n = clamp_f((axis == 0) ? vw_x : ((axis == 1) ? vw_y : vw_z), -0.5f * c2, 0.5f * c2);
+        float q2 = (axis == 0) ? u2 : ((axis == 1) ? v2 : w2);
+        float rhs_rho, rhs_p;
+        hs_state(cell_z_world(lvl, k), c, rhs_rho, rhs_p);
+        float q_imp = clamp_f(c.wall_admittance * (p2 - rhs_p) / (r2 * c2), -0.25f * c2, 0.25f * c2);
+        float q1 = 2.0f * vw_n - q2 - 2.0f * q_imp;
+        r1 = r2; p1 = p2;
+        u1 = (axis == 0) ? q1 : u2;
+        v1 = (axis == 1) ? q1 : v2;
+        w1 = (axis == 2) ? q1 : w2;
+        hllc_flux_1d(r1, u1, v1, w1, p1, r2, u2, v2, w2, p2, axis, gamma,
+                     out_rho, out_mx, out_my, out_mz, out_ene);
+        return;
+    }
+
+    // 2nd-order MUSCL reconstruction with Van Leer TVD slope limiter (1st-order fallback next to IB)
+    int tLL = tile_idx(lx - 2 * di, ly - 2 * dj, lz - 2 * dk);
+    int tRR = tile_idx(lx + di,     ly + dj,     lz + dk);
+    float ibLL = s_ib[tLL];
+    float ibRR = s_ib[tRR];
+
+    float rL = r1, uL = u1, vL = v1, wL = w1, pL = p1;
+    if (ibLL < 0.5f) {
+        rL = fmaxf(1e-4f, r1 + 0.5f * van_leer(r1 - s_rho[tLL], r2 - r1));
+        uL = u1 + 0.5f * van_leer(u1 - s_u[tLL], u2 - u1);
+        vL = v1 + 0.5f * van_leer(v1 - s_v[tLL], v2 - v1);
+        wL = w1 + 0.5f * van_leer(w1 - s_w[tLL], w2 - w1);
+        pL = fmaxf(100.0f, p1 + 0.5f * van_leer(p1 - s_p[tLL], p2 - p1));
+    }
+
+    float rR = r2, uR = u2, vR = v2, wR = w2, pR = p2;
+    if (ibRR < 0.5f) {
+        rR = fmaxf(1e-4f, r2 - 0.5f * van_leer(r2 - r1, s_rho[tRR] - r2));
+        uR = u2 - 0.5f * van_leer(u2 - u1, s_u[tRR] - u2);
+        vR = v2 - 0.5f * van_leer(v2 - v1, s_v[tRR] - v2);
+        wR = w2 - 0.5f * van_leer(w2 - w1, s_w[tRR] - w2);
+        pR = fmaxf(100.0f, p2 - 0.5f * van_leer(p2 - p1, s_p[tRR] - p2));
+    }
+
+    hllc_flux_1d(rL, uL, vL, wL, pL, rR, uR, vR, wR, pR, axis, gamma,
+                 out_rho, out_mx, out_my, out_mz, out_ene);
+
+    // Thermoviscous Navier-Stokes diffusive flux (Stokes shear + bulk viscosity + Fourier conduction)
+    float mu = (float)c.mu_a;
+    float mu_b = c.bulk_viscosity_a;
+    if (mu > 0.0f || mu_b > 0.0f) {
+        float inv_dx = 1.0f / lvl.dx;
+        float dux_dn = (u2 - u1) * inv_dx;
+        float duy_dn = (v2 - v1) * inv_dx;
+        float duz_dn = (w2 - w1) * inv_dx;
+        float u_f = 0.5f * (u1 + u2);
+        float v_f = 0.5f * (v1 + v2);
+        float w_f = 0.5f * (w1 + w2);
+
+        float lam_plus_2mu = mu_b + 1.3333334f * mu;
+        float tau_xx = (axis == 0) ? (lam_plus_2mu * dux_dn) : (mu * dux_dn);
+        float tau_yy = (axis == 1) ? (lam_plus_2mu * duy_dn) : (mu * duy_dn);
+        float tau_zz = (axis == 2) ? (lam_plus_2mu * duz_dn) : (mu * duz_dn);
+
+        float mu_th = mu + 0.5f * mu_b;
+        float pr = fmaxf(0.1f, c.prandtl_a);
+        float k_over_r = gamma / ((gamma - 1.0f) * pr) * mu_th;
+        float q_diff = -k_over_r * ((p2 / r2) - (p1 / r1)) * inv_dx;
+
+        float f_v_ene = u_f * tau_xx + v_f * tau_yy + w_f * tau_zz - q_diff;
+
+        out_mx  -= tau_xx;
+        out_my  -= tau_yy;
+        out_mz  -= tau_zz;
+        out_ene -= f_v_ene;
+    }
+}
+
 __device__ __forceinline__ void eval_face_flux(
     const FluidLevelGpu& lvl, const FluidConstantsGpu& c,
     int stage, float gamma,
@@ -541,14 +682,66 @@ __global__ void k_euler_outer_bc_slab_z(FluidLevelGpu lvl, int32_t stage) {
 __global__ void k_euler_rk_stage(
     FluidLevelGpu lvl, FluidConstantsGpu c, int32_t stage, float dt
 ) {
+    // Cooperative shared-memory primitive + IB tile for blockDim = (8, 8, 4) with 2-cell MUSCL halo:
+    // (8+4) x (8+4) x (4+4) = 12 x 12 x 8 = 1152 cells -> 6 * 1152 * 4 = 27 KB SMEM.
+    // Eliminates ~24x redundant global loads and cons_to_prim divisions per cell.
+    constexpr int BX = 8;
+    constexpr int BY = 8;
+    constexpr int BZ = 4;
+    constexpr int SX = BX + 4;
+    constexpr int SY = BY + 4;
+    constexpr int SZ = BZ + 4;
+    constexpr int TILE_N = SX * SY * SZ;
+    constexpr int NT = BX * BY * BZ;
+
+    __shared__ float s_rho[TILE_N];
+    __shared__ float s_u[TILE_N];
+    __shared__ float s_v[TILE_N];
+    __shared__ float s_w[TILE_N];
+    __shared__ float s_p[TILE_N];
+    __shared__ float s_ib[TILE_N];
+
     int h = lvl.halo;
-    int i = h + blockIdx.x * blockDim.x + threadIdx.x;
-    int j = h + blockIdx.y * blockDim.y + threadIdx.y;
-    int k = h + blockIdx.z * blockDim.z + threadIdx.z;
+    float gamma = (float)c.gamma_a;
+
+    int i0 = h + blockIdx.x * BX - 2;
+    int j0 = h + blockIdx.y * BY - 2;
+    int k0 = h + blockIdx.z * BZ - 2;
+    int tid = (threadIdx.z * BY + threadIdx.y) * BX + threadIdx.x;
+
+    for (int idx = tid; idx < TILE_N; idx += NT) {
+        int lx = idx % SX;
+        int ly = (idx / SX) % SY;
+        int lz = idx / (SX * SY);
+        int gi = min(max(i0 + lx, 0), lvl.nxp - 1);
+        int gj = min(max(j0 + ly, 0), lvl.nyp - 1);
+        int gk = min(max(k0 + lz, 0), lvl.nzp - 1);
+        size_t gcid = idx_cell(gi, gj, gk, lvl.nxp, lvl.nyp);
+        float rr, uu, vv, ww, pp;
+        if (stage == 0) {
+            cons_to_prim(lvl, gcid, gamma, rr, uu, vv, ww, pp);
+        } else {
+            cons1_to_prim(lvl, gcid, gamma, rr, uu, vv, ww, pp);
+        }
+        s_rho[idx] = rr;
+        s_u[idx]   = uu;
+        s_v[idx]   = vv;
+        s_w[idx]   = ww;
+        s_p[idx]   = pp;
+        s_ib[idx]  = (lvl.cell_ib != nullptr) ? lvl.cell_ib[gcid] : 0.0f;
+    }
+    __syncthreads();
+
+    int i = h + blockIdx.x * BX + threadIdx.x;
+    int j = h + blockIdx.y * BY + threadIdx.y;
+    int k = h + blockIdx.z * BZ + threadIdx.z;
     if (i >= h + lvl.nx || j >= h + lvl.ny || k >= h + lvl.nz) return;
 
+    int lx = threadIdx.x + 2;
+    int ly = threadIdx.y + 2;
+    int lz = threadIdx.z + 2;
     size_t cid = idx_cell(i, j, k, lvl.nxp, lvl.nyp);
-    float ib = (lvl.cell_ib != nullptr) ? lvl.cell_ib[cid] : 0.0f;
+    float ib = s_ib[tile_idx(lx, ly, lz)];
     if (ib >= 0.5f) {
         if (stage == 0) {
             lvl.u1_rho[cid] = lvl.u_rho[cid];
@@ -564,7 +757,6 @@ __global__ void k_euler_rk_stage(
         return;
     }
 
-    float gamma = (float)c.gamma_a;
     float fxm_r, fxm_u, fxm_v, fxm_w, fxm_e;
     float fxp_r, fxp_u, fxp_v, fxp_w, fxp_e;
     float fym_r, fym_u, fym_v, fym_w, fym_e;
@@ -572,12 +764,12 @@ __global__ void k_euler_rk_stage(
     float fzm_r, fzm_u, fzm_v, fzm_w, fzm_e;
     float fzp_r, fzp_u, fzp_v, fzp_w, fzp_e;
 
-    eval_face_flux(lvl, c, stage, gamma, i,     j,     k,     0, fxm_r, fxm_u, fxm_v, fxm_w, fxm_e);
-    eval_face_flux(lvl, c, stage, gamma, i + 1, j,     k,     0, fxp_r, fxp_u, fxp_v, fxp_w, fxp_e);
-    eval_face_flux(lvl, c, stage, gamma, i,     j,     k,     1, fym_r, fym_u, fym_v, fym_w, fym_e);
-    eval_face_flux(lvl, c, stage, gamma, i,     j + 1, k,     1, fyp_r, fyp_u, fyp_v, fyp_w, fyp_e);
-    eval_face_flux(lvl, c, stage, gamma, i,     j,     k,     2, fzm_r, fzm_u, fzm_v, fzm_w, fzm_e);
-    eval_face_flux(lvl, c, stage, gamma, i,     j,     k + 1, 2, fzp_r, fzp_u, fzp_v, fzp_w, fzp_e);
+    eval_face_flux_tile(lvl, c, s_rho, s_u, s_v, s_w, s_p, s_ib, gamma, i,     j,     k,     lx,     ly,     lz,     0, fxm_r, fxm_u, fxm_v, fxm_w, fxm_e);
+    eval_face_flux_tile(lvl, c, s_rho, s_u, s_v, s_w, s_p, s_ib, gamma, i + 1, j,     k,     lx + 1, ly,     lz,     0, fxp_r, fxp_u, fxp_v, fxp_w, fxp_e);
+    eval_face_flux_tile(lvl, c, s_rho, s_u, s_v, s_w, s_p, s_ib, gamma, i,     j,     k,     lx,     ly,     lz,     1, fym_r, fym_u, fym_v, fym_w, fym_e);
+    eval_face_flux_tile(lvl, c, s_rho, s_u, s_v, s_w, s_p, s_ib, gamma, i,     j + 1, k,     lx,     ly + 1, lz,     1, fyp_r, fyp_u, fyp_v, fyp_w, fyp_e);
+    eval_face_flux_tile(lvl, c, s_rho, s_u, s_v, s_w, s_p, s_ib, gamma, i,     j,     k,     lx,     ly,     lz,     2, fzm_r, fzm_u, fzm_v, fzm_w, fzm_e);
+    eval_face_flux_tile(lvl, c, s_rho, s_u, s_v, s_w, s_p, s_ib, gamma, i,     j,     k + 1, lx,     ly,     lz + 1, 2, fzp_r, fzp_u, fzp_v, fzp_w, fzp_e);
 
     float inv_dx = 1.0f / lvl.dx;
     float rhs_r = -((fxp_r - fxm_r) + (fyp_r - fym_r) + (fzp_r - fzm_r)) * inv_dx;
@@ -907,6 +1099,80 @@ __global__ void k_euler_amr_fill_ghosts(FluidLevelGpu child, FluidLevelGpu paren
             float wy = dj ? ty : (1.0f - ty);
             for (int di = 0; di <= 1; ++di) {
                 float wx = di ? tx : (1.0f - tx);
+                float w = wx * wy * wz;
+                size_t pid = idx_cell(i0 + di, j0 + dj, k0 + dk, parent.nxp, parent.nyp);
+                rho += w * parent.u_rho[pid];
+                mx  += w * parent.u_mx[pid];
+                my  += w * parent.u_my[pid];
+                mz  += w * parent.u_mz[pid];
+                ene += w * parent.u_ene[pid];
+            }
+        }
+    }
+    size_t cid = idx_cell(i, j, k, child.nxp, child.nyp);
+    if (target_stage == 0) {
+        child.u_rho[cid] = rho;
+        child.u_mx[cid]  = mx;
+        child.u_my[cid]  = my;
+        child.u_mz[cid]  = mz;
+        child.u_ene[cid] = ene;
+    } else {
+        child.u1_rho[cid] = rho;
+        child.u1_mx[cid]  = mx;
+        child.u1_my[cid]  = my;
+        child.u1_mz[cid]  = mz;
+        child.u1_ene[cid] = ene;
+    }
+}
+
+__global__ void k_euler_amr_fill_ghosts_slab(
+    FluidLevelGpu child, FluidLevelGpu parent, int32_t target_stage, int32_t axis
+) {
+    int hc = child.halo;
+    int tx = blockIdx.x * blockDim.x + threadIdx.x;
+    int ty = blockIdx.y * blockDim.y + threadIdx.y;
+    int tz = blockIdx.z * blockDim.z + threadIdx.z;
+
+    int i, j, k;
+    if (axis == 0) {
+        if (tx >= 2 * hc || ty >= child.nyp || tz >= child.nzp) return;
+        i = (tx < hc) ? tx : (hc + child.nx + (tx - hc));
+        j = ty;
+        k = tz;
+    } else if (axis == 1) {
+        if (tx >= child.nx || ty >= 2 * hc || tz >= child.nzp) return;
+        i = hc + tx;
+        j = (ty < hc) ? ty : (hc + child.ny + (ty - hc));
+        k = tz;
+    } else {
+        if (tx >= child.nx || ty >= child.ny || tz >= 2 * hc) return;
+        i = hc + tx;
+        j = hc + ty;
+        k = (tz < hc) ? tz : (hc + child.nz + (tz - hc));
+    }
+
+    float x = child.ox + ((float)(i - hc) + 0.5f) * child.dx;
+    float y = child.oy + ((float)(j - hc) + 0.5f) * child.dx;
+    float z = child.oz + ((float)(k - hc) + 0.5f) * child.dx;
+
+    float fx = (x - parent.ox) / parent.dx - 0.5f + (float)parent.halo;
+    float fy = (y - parent.oy) / parent.dx - 0.5f + (float)parent.halo;
+    float fz = (z - parent.oz) / parent.dx - 0.5f + (float)parent.halo;
+
+    int i0 = max(0, min(parent.nxp - 2, (int)floorf(fx)));
+    int j0 = max(0, min(parent.nyp - 2, (int)floorf(fy)));
+    int k0 = max(0, min(parent.nzp - 2, (int)floorf(fz)));
+    float gx = clamp_f(fx - (float)i0, 0.0f, 1.0f);
+    float gy = clamp_f(fy - (float)j0, 0.0f, 1.0f);
+    float gz = clamp_f(fz - (float)k0, 0.0f, 1.0f);
+
+    float rho = 0.0f, mx = 0.0f, my = 0.0f, mz = 0.0f, ene = 0.0f;
+    for (int dk = 0; dk <= 1; ++dk) {
+        float wz = dk ? gz : (1.0f - gz);
+        for (int dj = 0; dj <= 1; ++dj) {
+            float wy = dj ? gy : (1.0f - gy);
+            for (int di = 0; di <= 1; ++di) {
+                float wx = di ? gx : (1.0f - gx);
                 float w = wx * wy * wz;
                 size_t pid = idx_cell(i0 + di, j0 + dj, k0 + dk, parent.nxp, parent.nyp);
                 rho += w * parent.u_rho[pid];

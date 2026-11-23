@@ -577,17 +577,61 @@ __device__ __forceinline__ void d_shell_integrate_particle_one(
     }
 
     float f_rho = fmaxf(0.0f, pts.fluid_rho[p]);
+    float m0 = fmaxf(1e-18f, pts.mass[p]);
     float m_add = f_rho * pts.area[p] * fmaxf(0.0f, pts.hyd_len[p]);
-    float m_eff = fmaxf(1e-18f, pts.mass[p] + m_add);
-    float inv_m = 1.0f / m_eff;
-    float fx = shell.p_fx[p] + pts.fx_ext[p];
-    float fy = shell.p_fy[p] + pts.fy_ext[p];
-    float fz = shell.p_fz[p] + pts.fz_ext[p];
+    float m_n = m0 + m_add;
 
-    float damp = (f_rho > 50.0f) ? expf(-dt_s * 1.2f) : 1.0f;
-    float vx = (pts.vx[p] + dt_s * (fx * inv_m + gx)) * damp;
-    float vy = (pts.vy[p] + dt_s * (fy * inv_m + gy)) * damp;
-    float vz = (pts.vz[p] + dt_s * (fz * inv_m + gz)) * damp;
+    float fx_el = shell.p_fx[p];
+    float fy_el = shell.p_fy[p];
+    float fz_el = shell.p_fz[p];
+
+    // Zener Standard Linear Solid (SLS) viscoelastic internal relaxation for thin shells
+    if ((pflag & 8u) && mat.sls_beta > 0.0f && mat.sls_tau > 1e-9f && pts.q_visc != nullptr) {
+        float decay = expf(-dt_s / mat.sls_tau);
+        size_t n_pts = (size_t)pts.count;
+        float qx = decay * pts.q_visc[0 * n_pts + (size_t)p] + (1.0f - decay) * fx_el;
+        float qy = decay * pts.q_visc[1 * n_pts + (size_t)p] + (1.0f - decay) * fy_el;
+        float qz = decay * pts.q_visc[2 * n_pts + (size_t)p] + (1.0f - decay) * fz_el;
+        pts.q_visc[0 * n_pts + (size_t)p] = qx;
+        pts.q_visc[1 * n_pts + (size_t)p] = qy;
+        pts.q_visc[2 * n_pts + (size_t)p] = qz;
+        float beta_s = fminf(mat.sls_beta, 0.25f);
+        fx_el += beta_s * (fx_el - qx);
+        fy_el += beta_s * (fy_el - qy);
+        fz_el += beta_s * (fz_el - qz);
+    }
+
+    float fx = fx_el + pts.fx_ext[p];
+    float fy = fy_el + pts.fy_ext[p];
+    float fz = fz_el + pts.fz_ext[p];
+
+    float ax, ay, az;
+    if (pflag & 8u) {
+        // Potential-flow added mass acts strictly along the shell normal; in-plane tangential inertia remains m0.
+        float nx = pts.nx[p], ny = pts.ny[p], nz = pts.nz[p];
+        float fn = fx * nx + fy * ny + fz * nz;
+        float inv_m0 = 1.0f / m0;
+        float an = fn / m_n;
+        ax = (fx - fn * nx) * inv_m0 + an * nx + gx;
+        ay = (fy - fn * ny) * inv_m0 + an * ny + gy;
+        az = (fz - fn * nz) * inv_m0 + an * nz + gz;
+    } else {
+        float inv_m = 1.0f / m_n;
+        ax = fx * inv_m + gx;
+        ay = fy * inv_m + gy;
+        az = fz * inv_m + gz;
+    }
+
+    // Physical Stokes viscous boundary-layer damping when submerged in liquid:
+    // tau_w ~ sqrt(2 * rho_f * mu_f * omega) * v => gamma_sub ~ 85 * sqrt(rho_f / 1000) * (A / m_n)
+    float damp = 1.0f;
+    if (f_rho > 10.0f) {
+        float gamma_sub = clamp_f(85.0f * sqrtf(f_rho * 1e-3f) * (pts.area[p] / m_n), 0.0f, 15.0f);
+        damp = expf(-dt_s * gamma_sub);
+    }
+    float vx = (pts.vx[p] + dt_s * ax) * damp;
+    float vy = (pts.vy[p] + dt_s * ay) * damp;
+    float vz = (pts.vz[p] + dt_s * az) * damp;
 
     float x_next = pts.px[p] + dt_s * vx;
     float y_next = pts.py[p] + dt_s * vy;
