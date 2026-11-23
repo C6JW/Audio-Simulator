@@ -171,6 +171,7 @@ pub struct MultiphysicsEngine {
     pub has_contact: bool,
     pub max_solid_wave_speed: f64,
     pub min_shell_edge: f64,
+    pub min_shell_bend_dt: f64,
     pub solid_friction_mu: f32,
     pub stream: CudaStream,
     pub initial_water_volume: f64,
@@ -674,6 +675,7 @@ impl MultiphysicsEngine {
         let mut has_contact = false;
         let mut max_solid_wave_speed = 0.0_f64;
         let mut min_shell_edge = f64::INFINITY;
+        let mut min_shell_bend_dt = f64::INFINITY;
         let mut solid_friction_mu = 0.35_f32;
 
         let mut shell_host_saved: Option<ShellMeshHost> = None;
@@ -684,10 +686,9 @@ impl MultiphysicsEngine {
         if !scene.solids.is_empty() {
             let mut mats_gpu = Vec::with_capacity(scene.solids.len());
             let mut p_host = MpmParticlesHost::default();
-            let mut p_static_host = MpmParticlesHost::default();
+            let mut static_ib_bodies: Vec<usize> = Vec::new();
             let mut shell_host = ShellMeshHost::default();
             let mut q0_list = Vec::new();
-            let mut q0_static = Vec::new();
             let mut uv_list: Vec<[f32; 2]> = Vec::new();
             let mut body_ids = std::collections::BTreeSet::new();
 
@@ -719,7 +720,7 @@ impl MultiphysicsEngine {
                 let skip_sample = is_euler && is_static_only;
                 let separate_static_ib = !is_euler && is_static_only && !body.material.is_shell;
                 if separate_static_ib {
-                    sample_bulk_solid_into(body, idx as i32, &mut p_static_host, &mut q0_static);
+                    static_ib_bodies.push(idx);
                 } else if !skip_sample {
                     let p_before = p_host.len();
                     if body.material.is_shell {
@@ -743,20 +744,123 @@ impl MultiphysicsEngine {
                 }
             }
 
-            if !p_static_host.is_empty() {
-                p_static_host.finalize_soa(&q0_static);
-                let mut p_stat_dev = MpmParticlesDevice::from_host(&vram, &p_static_host)?;
-                let d_stat = p_stat_dev.descriptor();
+            // Analytical subcell face-area IB baking for static rigid bodies in non-Euler mode:
+            // eliminates particle-splat staircasing on curved acoustic walls (e.g. Whispering Gallery)
+            // and guarantees watertight boundaries with zero thin-wall leakage.
+            if !static_ib_bodies.is_empty() {
                 for lvl in &mut levels {
-                    let d_lvl = lvl.descriptor();
-                    unsafe {
-                        sim_cuda::check_cuda(
-                            sim_ib_bake_static_level(d_stat, d_lvl, stream.raw()),
-                            "sim_ib_bake_static_level",
-                        )?;
+                    let nxp = lvl.nxp;
+                    let nyp = lvl.nyp;
+                    let nzp = lvl.nzp;
+                    let halo = lvl.halo;
+                    let dx = lvl.spec.dx;
+                    let ox = lvl.spec.ox;
+                    let oy = lvl.spec.oy;
+                    let oz = lvl.spec.oz;
+
+                    let mut bx_h = vec![0.0_f32; (nxp + 1) * nyp * nzp];
+                    let mut by_h = vec![0.0_f32; nxp * (nyp + 1) * nzp];
+                    let mut bz_h = vec![0.0_f32; nxp * nyp * (nzp + 1)];
+
+                    for &bidx in &static_ib_bodies {
+                        let shape = &scene.solids[bidx].shape;
+                        let (bmin, bmax) = shape.bounding_box();
+                        let pad = 1.5 * dx;
+
+                        let ix0 = (((bmin[0] - pad - ox) / dx).floor() as isize + halo as isize)
+                            .clamp(0, nxp as isize) as usize;
+                        let ix1 = (((bmax[0] + pad - ox) / dx).ceil() as isize + halo as isize)
+                            .clamp(0, nxp as isize) as usize;
+                        let iy0 = (((bmin[1] - pad - oy) / dx).floor() as isize + halo as isize)
+                            .clamp(0, nyp as isize) as usize;
+                        let iy1 = (((bmax[1] + pad - oy) / dx).ceil() as isize + halo as isize)
+                            .clamp(0, nyp as isize) as usize;
+                        let iz0 = (((bmin[2] - pad - oz) / dx).floor() as isize + halo as isize)
+                            .clamp(0, nzp as isize) as usize;
+                        let iz1 = (((bmax[2] + pad - oz) / dx).ceil() as isize + halo as isize)
+                            .clamp(0, nzp as isize) as usize;
+
+                        let cx1 = ix1.min(nxp - 1);
+                        let cy1 = iy1.min(nyp - 1);
+                        let cz1 = iz1.min(nzp - 1);
+
+                        // X-faces: (nxp + 1) x nyp x nzp
+                        for k in iz0..=cz1 {
+                            let z = oz + ((k as isize - halo as isize) as f32 + 0.5) * dx;
+                            for j in iy0..=cy1 {
+                                let y = oy + ((j as isize - halo as isize) as f32 + 0.5) * dx;
+                                let row = (nxp + 1) * (j + nyp * k);
+                                for i in ix0..=ix1 {
+                                    let x = ox + (i as isize - halo as isize) as f32 * dx;
+                                    let f = shape.subcell_volume_fraction([x, y, z], dx);
+                                    if f > 0.0 {
+                                        let slot = &mut bx_h[i + row];
+                                        if f > *slot {
+                                            *slot = f;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Y-faces: nxp x (nyp + 1) x nzp
+                        for k in iz0..=cz1 {
+                            let z = oz + ((k as isize - halo as isize) as f32 + 0.5) * dx;
+                            for j in iy0..=iy1 {
+                                let y = oy + (j as isize - halo as isize) as f32 * dx;
+                                let row = nxp * (j + (nyp + 1) * k);
+                                for i in ix0..=cx1 {
+                                    let x = ox + ((i as isize - halo as isize) as f32 + 0.5) * dx;
+                                    let f = shape.subcell_volume_fraction([x, y, z], dx);
+                                    if f > 0.0 {
+                                        let slot = &mut by_h[i + row];
+                                        if f > *slot {
+                                            *slot = f;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Z-faces: nxp x nyp x (nzp + 1)
+                        for k in iz0..=iz1 {
+                            let z = oz + (k as isize - halo as isize) as f32 * dx;
+                            for j in iy0..=cy1 {
+                                let y = oy + ((j as isize - halo as isize) as f32 + 0.5) * dx;
+                                let row = nxp * (j + nyp * k);
+                                for i in ix0..=cx1 {
+                                    let x = ox + ((i as isize - halo as isize) as f32 + 0.5) * dx;
+                                    let f = shape.subcell_volume_fraction([x, y, z], dx);
+                                    if f > 0.0 {
+                                        let slot = &mut bz_h[i + row];
+                                        if f > *slot {
+                                            *slot = f;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(ref mut buf) = lvl.ib_beta_x {
+                        buf.upload(&bx_h)?;
+                    }
+                    if let Some(ref mut buf) = lvl.ib_beta_static_x {
+                        buf.upload(&bx_h)?;
+                    }
+                    if let Some(ref mut buf) = lvl.ib_beta_y {
+                        buf.upload(&by_h)?;
+                    }
+                    if let Some(ref mut buf) = lvl.ib_beta_static_y {
+                        buf.upload(&by_h)?;
+                    }
+                    if let Some(ref mut buf) = lvl.ib_beta_z {
+                        buf.upload(&bz_h)?;
+                    }
+                    if let Some(ref mut buf) = lvl.ib_beta_static_z {
+                        buf.upload(&bz_h)?;
                     }
                 }
-                stream.sync()?;
             }
 
             if !p_host.is_empty() {
@@ -811,6 +915,34 @@ impl MultiphysicsEngine {
                         if !all_fixed {
                             let h_tri = (2.0 * shell_host.tri_area0[t] as f64).sqrt().max(0.0015);
                             min_shell_edge = min_shell_edge.min(h_tri);
+                        }
+                    }
+                    // Flexural bending wave CFL limit: dt_bend = 0.35 * l^2 / sqrt(D / (rho * h))
+                    for h_idx in 0..shell_host.hinge_e0.len() {
+                        let mat_idx = shell_host.hinge_mat_id[h_idx] as usize;
+                        let mat = &scene.solids[mat_idx].material;
+                        if mat.is_rigid_static {
+                            continue;
+                        }
+                        let e0 = shell_host.hinge_e0[h_idx] as usize;
+                        let e1 = shell_host.hinge_e1[h_idx] as usize;
+                        let o0 = shell_host.hinge_o0[h_idx] as usize;
+                        let o1 = shell_host.hinge_o1[h_idx] as usize;
+                        let fixed_opp = (p_host.flags[o0] & 3u32) != 0 && (p_host.flags[o1] & 3u32) != 0;
+                        if !fixed_opp {
+                            let dx = (p_host.px[e1] - p_host.px[e0]) as f64;
+                            let dy = (p_host.py[e1] - p_host.py[e0]) as f64;
+                            let dz = (p_host.pz[e1] - p_host.pz[e0]) as f64;
+                            let l_e = (dx * dx + dy * dy + dz * dz).sqrt().max(0.0015);
+                            let e_eff = 0.5 * (mat.e1 as f64 + mat.e2 as f64);
+                            let nu = (mat.nu12 as f64).clamp(0.0, 0.45);
+                            let h_th = (mat.thickness as f64).max(1e-5);
+                            let rho = (mat.rho as f64).max(1.0);
+                            let alpha_b = h_th * (e_eff / (12.0 * rho * (1.0 - nu * nu))).sqrt();
+                            if alpha_b > 1e-12 {
+                                let dt_b = 0.35 * l_e * l_e / alpha_b;
+                                min_shell_bend_dt = min_shell_bend_dt.min(dt_b);
+                            }
                         }
                     }
                     let mut max_r_eff = 0.001_f32;
@@ -887,6 +1019,7 @@ impl MultiphysicsEngine {
             has_contact,
             max_solid_wave_speed,
             min_shell_edge,
+            min_shell_bend_dt,
             solid_friction_mu,
             stream,
             initial_water_volume: 0.0,
@@ -973,7 +1106,12 @@ impl MultiphysicsEngine {
             return (0, 0.0);
         }
         let solid_h = mpm_dx_fallback.min(self.min_shell_edge);
-        let dt_s_lim = 0.25 * solid_h / self.max_solid_wave_speed.max(1.0);
+        let dt_mem_lim = 0.25 * solid_h / self.max_solid_wave_speed.max(1.0);
+        let dt_s_lim = if self.min_shell_bend_dt.is_finite() {
+            dt_mem_lim.min(self.min_shell_bend_dt.max(0.25 * dt_mem_lim))
+        } else {
+            dt_mem_lim
+        };
         let n = (dt_step / dt_s_lim).ceil().max(1.0) as usize;
         (n, (dt_step / (n as f64)) as f32)
     }
@@ -1007,7 +1145,9 @@ impl MultiphysicsEngine {
             u_max_global = u_max_global.max(u_max_lvl);
 
             let dx = self.levels[li].spec.dx as f64;
-            dt_lim[li] = cfg.cfl_safety * dx / (c_max_lvl + u_max_lvl);
+            // 4th-order staggered FDTD stability bound is 1 / (sqrt(3) * 7/6) = 0.4949.
+            let eff_cfl = cfg.cfl_safety.min(0.44);
+            dt_lim[li] = eff_cfl * dx / (c_max_lvl + u_max_lvl);
         }
 
         let k0 = (dt_probe / dt_lim[0]).ceil().max(1.0) as usize;
@@ -2486,11 +2626,18 @@ impl MultiphysicsEngine {
         let nu_eff = ((self.fluid_const.mu_a + self.fluid_const.bulk_viscosity_a as f64)
             / self.fluid_const.rho_a)
             * 2.5;
+        let has_fine_patches = self.levels.len() > 1;
         let compute_coarse_stride = |m: &SimReduceMetricsGpu, in_blast_burst: bool| -> (usize, f64) {
             let c0 = m.c_max_sq.sqrt().max(AIR_C) * 1.05;
             let u0 = m.u_max_sq.sqrt();
             let dt0_lim = cfl_eu * dx0 / (1.25 * c0 + 1.15 * u0 + 2.0 * nu_eff / dx0);
-            let max_s = if in_blast_burst { 2.0 } else { 32.0 };
+            let max_s = if in_blast_burst {
+                2.0
+            } else if has_fine_patches {
+                6.0
+            } else {
+                32.0
+            };
             let stride = (dt0_lim / dt_probe).floor().clamp(1.0, max_s) as usize;
             (stride, dt0_lim)
         };
@@ -2875,6 +3022,7 @@ impl MultiphysicsEngine {
             }
 
             // 3. Advance supersonic projectiles & sliding AMR shock patch
+            let mut fine_proj_steps: Vec<(usize, [f32; 3], [f32; 3], f32, f32)> = Vec::new();
             for pi in 0..self.scene.projectiles.len() {
                 let pspec = self.scene.projectiles[pi].clone();
                 let ps = &mut proj_states[pi];
@@ -3037,7 +3185,9 @@ impl MultiphysicsEngine {
                     continue;
                 }
 
-                // Apply bullet piston + drag on finest active level containing bullet
+                // Apply bullet piston + drag on finest active level containing bullet.
+                // When inside a fine AMR patch (li > 0), queue for smooth per-substep forcing inside
+                // Step 5 so Mach-2+ projectiles advance ~0.15*dx per RK2 substep without probe-rate buzzing.
                 let mut best_b_li = 0usize;
                 for li in 1..self.levels.len() {
                     if !active_mask[li] {
@@ -3055,29 +3205,39 @@ impl MultiphysicsEngine {
                         best_b_li = li;
                     }
                 }
-                let d_lvl = self.levels[best_b_li].descriptor();
-                unsafe {
-                    sim_cuda::check_cuda(
-                        sim_euler_apply_projectile(
-                            d_lvl,
-                            self.fluid_const,
-                            pos_old[0],
-                            pos_old[1],
-                            pos_old[2],
-                            pos_new[0],
-                            pos_new[1],
-                            pos_new[2],
-                            vel_cur[0],
-                            vel_cur[1],
-                            vel_cur[2],
-                            pspec.radius_m,
-                            pspec.length_m,
-                            dt_f32,
-                            self.d_proj_force.as_mut_ptr(),
-                            self.stream.raw(),
-                        ),
-                        "sim_euler_apply_projectile",
-                    )?;
+                if best_b_li == 0 {
+                    let d_lvl = self.levels[0].descriptor();
+                    unsafe {
+                        sim_cuda::check_cuda(
+                            sim_euler_apply_projectile(
+                                d_lvl,
+                                self.fluid_const,
+                                pos_old[0],
+                                pos_old[1],
+                                pos_old[2],
+                                pos_new[0],
+                                pos_new[1],
+                                pos_new[2],
+                                vel_cur[0],
+                                vel_cur[1],
+                                vel_cur[2],
+                                pspec.radius_m,
+                                pspec.length_m,
+                                dt_f32,
+                                self.d_proj_force.as_mut_ptr(),
+                                self.stream.raw(),
+                            ),
+                            "sim_euler_apply_projectile",
+                        )?;
+                    }
+                } else {
+                    fine_proj_steps.push((
+                        best_b_li,
+                        pos_old,
+                        vel_cur,
+                        pspec.radius_m,
+                        pspec.length_m,
+                    ));
                 }
                 if active_idx % 8 == 0 {
                     let spd = ((vel_cur[0] * vel_cur[0]
@@ -3176,7 +3336,7 @@ impl MultiphysicsEngine {
                 }
             }
 
-            // 5. Advance active fine patches by dt_probe
+            // 5. Advance active fine patches by dt_probe (with smooth per-substep projectile forcing)
             for li in 1..self.levels.len() {
                 if !active_mask[li] {
                     continue;
@@ -3186,7 +3346,37 @@ impl MultiphysicsEngine {
                 let p_idx = self.level_parents[li];
                 let d_parent = self.levels[p_idx].descriptor();
                 let d_child = self.levels[li].descriptor();
-                for _ in 0..kf {
+                for sub in 0..kf {
+                    for &(p_li, p_pos0, p_vel, p_rad, p_len) in &fine_proj_steps {
+                        if p_li != li {
+                            continue;
+                        }
+                        let t0_sub = (sub as f32) * dt_f;
+                        let t1_sub = ((sub + 1) as f32) * dt_f;
+                        unsafe {
+                            sim_cuda::check_cuda(
+                                sim_euler_apply_projectile(
+                                    d_child,
+                                    self.fluid_const,
+                                    p_pos0[0] + p_vel[0] * t0_sub,
+                                    p_pos0[1] + p_vel[1] * t0_sub,
+                                    p_pos0[2] + p_vel[2] * t0_sub,
+                                    p_pos0[0] + p_vel[0] * t1_sub,
+                                    p_pos0[1] + p_vel[1] * t1_sub,
+                                    p_pos0[2] + p_vel[2] * t1_sub,
+                                    p_vel[0],
+                                    p_vel[1],
+                                    p_vel[2],
+                                    p_rad,
+                                    p_len,
+                                    dt_f,
+                                    self.d_proj_force.as_mut_ptr(),
+                                    self.stream.raw(),
+                                ),
+                                "sim_euler_apply_projectile_substep",
+                            )?;
+                        }
+                    }
                     unsafe {
                         sim_cuda::check_cuda(
                             sim_euler_amr_fill_ghosts(d_child, d_parent, 0, self.stream.raw()),

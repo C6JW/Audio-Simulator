@@ -5,7 +5,7 @@ use crate::units::*;
 
 #[inline]
 fn default_div_damp_coeff() -> f32 {
-    0.025
+    0.004
 }
 
 #[inline]
@@ -58,7 +58,7 @@ impl Default for FluidParams {
             vof_beta: 1.8,
             pml_coeff: 1.2,
             wall_absorption_alpha: 0.0,
-            div_damp_coeff: 0.025,
+            div_damp_coeff: 0.004,
             bulk_viscosity_a: 0.003,
             prandtl_a: 0.71,
         }

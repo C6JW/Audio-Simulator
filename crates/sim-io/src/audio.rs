@@ -381,6 +381,84 @@ pub fn write_probe_wav_f32<P: AsRef<Path>>(
     write_probe_wav_f32_with_gain(path, &sig, sr, peak_pa, rms_pa, None)
 }
 
+/// Process left and right oversampled GPU probe pressures (Pa) into an interleaved
+/// 2-channel 32-bit float stereo WAV using a single shared gain (-1.0 dBFS peak across both ears)
+/// so interaural time difference (ITD) and interaural level difference (ILD) remain physically exact.
+pub fn write_stereo_wav_f32<P: AsRef<Path>>(
+    path: P,
+    raw_left_pa: &[f32],
+    raw_right_pa: &[f32],
+    oversample_factor: usize,
+    probe_sample_rate: u32,
+    target_wav_sample_rate: Option<u32>,
+    highpass_hz: f64,
+) -> Result<WavWriteStats> {
+    let (sr_l, sig_l, peak_l, rms_l) = prepare_probe_wav_signal_f64(
+        raw_left_pa,
+        oversample_factor,
+        probe_sample_rate,
+        target_wav_sample_rate,
+        highpass_hz,
+    )?;
+    let (sr_r, sig_r, peak_r, rms_r) = prepare_probe_wav_signal_f64(
+        raw_right_pa,
+        oversample_factor,
+        probe_sample_rate,
+        target_wav_sample_rate,
+        highpass_hz,
+    )?;
+    if sr_l != sr_r {
+        return Err(AudioIoError::InvalidParam(
+            "left and right stereo sample rates do not match".to_string(),
+        ));
+    }
+    if let Some(parent) = path.as_ref().parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+
+    let n_frames = sig_l.len().min(sig_r.len());
+    let mut post_peak = peak_l.max(peak_r);
+    for i in 0..n_frames {
+        post_peak = post_peak.max(sig_l[i].abs()).max(sig_r[i].abs());
+    }
+    let target_peak = 10.0_f64.powf(-1.0 / 20.0); // -1.0 dBFS
+    let (gain, gain_db) = if post_peak > 1e-18 {
+        let g = target_peak / post_peak;
+        (g, 20.0 * g.log10())
+    } else {
+        (1.0, 0.0)
+    };
+
+    let spec = WavSpec {
+        channels: 2,
+        sample_rate: sr_l,
+        bits_per_sample: 32,
+        sample_format: SampleFormat::Float,
+    };
+    let mut writer = WavWriter::create(path.as_ref(), spec)?;
+    let mut norm_peak = 0.0_f32;
+    for i in 0..n_frames {
+        let vl = ((sig_l[i] * gain).clamp(-0.9999, 0.9999)) as f32;
+        let vr = ((sig_r[i] * gain).clamp(-0.9999, 0.9999)) as f32;
+        norm_peak = norm_peak.max(vl.abs()).max(vr.abs());
+        writer.write_sample(vl)?;
+        writer.write_sample(vr)?;
+    }
+    writer.finalize()?;
+
+    Ok(WavWriteStats {
+        path: path.as_ref().display().to_string(),
+        sample_rate: sr_l,
+        sample_count: n_frames,
+        peak_pa: peak_l.max(peak_r),
+        rms_pa: (0.5 * (rms_l * rms_l + rms_r * rms_r)).sqrt(),
+        gain_applied_db: gain_db,
+        normalized_peak: norm_peak,
+    })
+}
+
 pub fn read_wav_f32<P: AsRef<Path>>(path: P) -> Result<(WavSpec, Vec<f32>)> {
     let mut reader = WavReader::open(path)?;
     let spec = reader.spec();

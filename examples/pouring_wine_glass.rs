@@ -12,24 +12,25 @@ fn main() -> Result<()> {
     let mut scene = Scene::minimal(
         "pouring_wine_glass",
         AmrDomainConfig {
-            origin: [-0.24, -0.24, -0.08],
-            dx0: 0.008,
-            nx0: 60,
-            ny0: 60,
-            nz0: 60,
+            origin: [-0.24, -0.24, -0.06],
+            dx0: 0.0075,
+            nx0: 64,
+            ny0: 64,
+            nz0: 64,
             pml_thickness: 6,
             pml_face_mask: PML_ALL_FACES,
             patches: vec![
-                // Level 1: High-res VOF multiphase & thin-shell crystal glass patch (dx1 = 4.0 mm)
+                // Level 1: 2.5 mm multiphase VOF + Kapila bubble + crystal wine glass patch
+                // Covers x,y in [-0.090, +0.090] m, z in [0.0075, +0.2775] m
                 AmrPatchConfig {
                     parent_level: Some(0),
-                    refine_ratio: 2,
-                    off_x: 18,
-                    off_y: 18,
-                    off_z: 10,
-                    nx: 48,
-                    ny: 48,
-                    nz: 76,
+                    refine_ratio: 3,
+                    off_x: 20,
+                    off_y: 20,
+                    off_z: 9,
+                    nx: 72,
+                    ny: 72,
+                    nz: 108,
                     enable_flow: Some(true),
                     active_start_s: 0.0,
                     active_end_s: None,
@@ -38,14 +39,14 @@ fn main() -> Result<()> {
         },
     );
 
-    // Level 0 propagates room air acoustics; Level 1 runs full two-phase VOF + CSF surface tension
+    // Level 0 propagates room air acoustics; Level 1 runs full two-phase VOF + CSF + Kapila bubbles
     scene.enable_flow_advection = false;
 
     let mut glass_mat = SolidMaterial::crystal_glass();
     glass_mat.is_shell = true;
     glass_mat.thickness = 0.0012;
     glass_mat.eta_visc = 3.0;
-    glass_mat.sls_beta = 0.0003;
+    glass_mat.sls_beta = 0.0008;
     glass_mat.g_c = 0.0;
 
     // Watertight crystal wine glass bowl (bottom pole at z=0.020m, open rim at z=0.115m, R_max=36mm)
@@ -63,14 +64,14 @@ fn main() -> Result<()> {
         shape: GeometryShape::RevolutionShell {
             center_xy: [0.0, 0.0],
             profile_zr: profile,
-            n_theta: 56,
-            n_meridian: 24,
+            n_theta: 64,
+            n_meridian: 28,
             hyd_len: 0.011,
         },
         material: glass_mat,
         initial_velocity: [0.0, 0.0, 0.0],
         orientation_euler_xyz: [0.0, 0.0, 0.0],
-        particle_spacing: 0.0038,
+        particle_spacing: 0.0032,
         gc_heterogeneity_amp: 0.0,
         is_kinematic_rigid: false,
         bcs: vec![SolidBoundaryCondition::ClampedRegion {
@@ -82,9 +83,9 @@ fn main() -> Result<()> {
     // Water pouring stream from 15 cm above the glass bottom (z = 0.170 m) during t = 0.75..5.75 s
     scene.fluid_inflows.push(FluidInflowSpec {
         center: [0.006, 0.0, 0.170],
-        radius: 0.0055,
-        height: 0.008,
-        velocity: [0.0, 0.0, -0.75],
+        radius: 0.0045,
+        height: 0.006,
+        velocity: [0.0, 0.0, -0.80],
         start_time_s: 0.75,
         end_time_s: 5.75,
         ramp_s: 0.08,
@@ -104,12 +105,12 @@ fn main() -> Result<()> {
         target_wav_sample_rate: Some(48_000),
         telemetry_interval_s: 0.05,
         output_dir: Some(out_dir.to_path_buf()),
-        cfl_safety: 0.35,
+        cfl_safety: 0.42,
         print_progress: true,
         ..Default::default()
     };
 
-    println!("=== Scene 3: Running Pouring Water into Crystal Wine Glass ===");
+    println!("=== Scene 3: Running Pouring Water into Crystal Wine Glass (dx1 = 2.5 mm AMR) ===");
     let mut engine = MultiphysicsEngine::new(scene, None)?;
     let mut res = engine.run(&cfg)?;
 

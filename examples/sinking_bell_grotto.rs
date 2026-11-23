@@ -12,22 +12,40 @@ fn main() -> Result<()> {
     let mut scene = Scene::minimal(
         "sinking_bell_grotto",
         AmrDomainConfig {
-            origin: [-0.288, -0.288, -0.352],
-            dx0: 0.008,
-            nx0: 72,
-            ny0: 72,
-            nz0: 88,
+            origin: [-0.288, -0.288, -0.336],
+            dx0: 0.006,
+            nx0: 96,
+            ny0: 96,
+            nz0: 108,
             pml_thickness: 6,
             pml_face_mask: PML_ALL_FACES,
-            patches: vec![],
+            patches: vec![
+                // Level 1: 3.0 mm two-phase VOF + splash + submerged bell patch
+                // Covers x,y in [-0.132, +0.132] m, z in [-0.252, +0.204] m
+                AmrPatchConfig {
+                    parent_level: Some(0),
+                    refine_ratio: 2,
+                    off_x: 26,
+                    off_y: 26,
+                    off_z: 14,
+                    nx: 88,
+                    ny: 88,
+                    nz: 152,
+                    enable_flow: Some(true),
+                    active_start_s: 0.0,
+                    active_end_s: None,
+                },
+            ],
         },
     );
 
     scene.fluid.wall_absorption_alpha = 0.05;
     scene.background_water = vec![GeometryShape::HalfSpaceZ { z_max: -0.020 }];
+    // Level 0 propagates stone grotto acoustics; Level 1 solves active VOF water entry,
+    // splashing, entrained air cavity, and two-way fluid-shell coupling.
     scene.enable_flow_advection = false;
 
-    // Reflective stone grotto partial cylindrical enclosure
+    // Reflective stone grotto cylindrical enclosure (baked with analytical subcell faces)
     let mut stone = SolidMaterial::granite_stone();
     stone.is_rigid_static = true;
     scene.solids.push(SolidBodySpec {
@@ -38,12 +56,12 @@ fn main() -> Result<()> {
             r_inner: 0.22,
             r_outer: 0.26,
             z_min: -0.28,
-            z_max: 0.28,
+            z_max: 0.26,
         },
         material: stone,
         initial_velocity: [0.0, 0.0, 0.0],
         orientation_euler_xyz: [0.0, 0.0, 0.0],
-        particle_spacing: 0.016,
+        particle_spacing: 0.012,
         gc_heterogeneity_amp: 0.0,
         is_kinematic_rigid: false,
         bcs: vec![],
@@ -53,8 +71,8 @@ fn main() -> Result<()> {
     let mut bell_mat = SolidMaterial::bell_bronze();
     bell_mat.is_shell = true;
     bell_mat.thickness = 0.0044;
-    bell_mat.eta_visc = 4.0;
-    bell_mat.sls_beta = 0.0004;
+    bell_mat.eta_visc = 3.5;
+    bell_mat.sls_beta = 0.0005;
     bell_mat.g_c = 0.0;
 
     let profile = vec![
@@ -71,14 +89,14 @@ fn main() -> Result<()> {
         shape: GeometryShape::RevolutionShell {
             center_xy: [0.0, 0.0],
             profile_zr: profile,
-            n_theta: 48,
-            n_meridian: 20,
+            n_theta: 64,
+            n_meridian: 26,
             hyd_len: 0.042,
         },
         material: bell_mat,
         initial_velocity: [0.0, 0.0, 0.0],
         orientation_euler_xyz: [0.0, 0.0, 0.0],
-        particle_spacing: 0.007,
+        particle_spacing: 0.0055,
         gc_heterogeneity_amp: 0.0,
         is_kinematic_rigid: false,
         bcs: vec![
@@ -92,8 +110,8 @@ fn main() -> Result<()> {
     });
 
     // Smooth lowering trajectory for the bell crown:
-    // - 0.00..2.25 s: suspended stationary in air (struck at t = 0.766 s)
-    // - 2.25..4.45 s: lowered at vz = -0.10 m/s by 22 cm into the water pool (z_rim: +0.02 -> -0.20 m)
+    // - 0.00..2.25 s: suspended stationary in air (struck brightly at t = 0.766 s)
+    // - 2.25..4.45 s: lowered at vz = -0.10 m/s by 22 cm into the live VOF water pool (z_rim: +0.02 -> -0.20 m)
     // - 4.45..7.00 s: held stationary underwater while ringing at its added-mass-shifted frequency
     scene.kinematic_trajectories.push(KinematicTrajectorySpec {
         body_id: 0,
@@ -128,7 +146,7 @@ fn main() -> Result<()> {
         material: SolidMaterial::bell_bronze(),
         initial_velocity: [0.0, 0.0, 0.0],
         orientation_euler_xyz: [0.0, 0.0, 0.0],
-        particle_spacing: 0.006,
+        particle_spacing: 0.005,
         gc_heterogeneity_amp: 0.0,
         is_kinematic_rigid: true,
         bcs: vec![],
@@ -167,7 +185,7 @@ fn main() -> Result<()> {
     });
     scene.microphones.push(MicrophoneSpec {
         name: "bell_hydrophone.wav".to_string(),
-        position: [0.0, 0.15, -0.14],
+        position: [0.0, 0.105, -0.14],
         is_hydrophone: true,
     });
 
@@ -179,12 +197,12 @@ fn main() -> Result<()> {
         target_wav_sample_rate: Some(48_000),
         telemetry_interval_s: 0.05,
         output_dir: Some(out_dir.to_path_buf()),
-        cfl_safety: 0.35,
+        cfl_safety: 0.42,
         print_progress: true,
         ..Default::default()
     };
 
-    println!("=== Scene 2: Running Sinking Bell in Stone Grotto (Air -> Water Pitch Glide) ===");
+    println!("=== Scene 2: Running Sinking Bell in Stone Grotto (Live 3 mm VOF Water Entry + Pitch Glide) ===");
     let mut engine = MultiphysicsEngine::new(scene, None)?;
     let mut res = engine.run(&cfg)?;
 

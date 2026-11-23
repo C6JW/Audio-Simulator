@@ -7,8 +7,8 @@ pub mod video;
 pub use audio::{
     apply_highpass_2nd_order, decimate_kaiser, generate_fallback_speech_phrase,
     prepare_probe_wav_signal_f64, read_wav_f32, read_wav_mono_f32, resample_kaiser_upsample,
-    resample_sinc_f32, write_probe_wav_f32, write_probe_wav_f32_with_gain, AudioIoError,
-    WavWriteStats,
+    resample_sinc_f32, write_probe_wav_f32, write_probe_wav_f32_with_gain, write_stereo_wav_f32,
+    AudioIoError, WavWriteStats,
 };
 pub use hound::SampleFormat;
 pub use obj_loader::{ObjError, ObjMesh};

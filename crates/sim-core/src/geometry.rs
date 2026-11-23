@@ -67,6 +67,19 @@ pub enum GeometryShape {
         n_meridian: usize,
         hyd_len: f32,
     },
+    SquareJarShell {
+        center_xy: [f32; 2],
+        z_bottom: f32,
+        body_half_width: f32,
+        body_height: f32,
+        shoulder_height: f32,
+        neck_radius: f32,
+        neck_height: f32,
+        corner_radius: f32,
+        n_perim: usize,
+        n_height: usize,
+        hyd_len: f32,
+    },
     CanyonTerrain {
         floor_z: f32,
         valley_half_width_y: f32,
@@ -215,7 +228,9 @@ impl GeometryShape {
                 let dy = p[1] - center_xy[1];
                 dx * dx + dy * dy <= radius * radius
             }
-            GeometryShape::CurvedShell { .. } | GeometryShape::RevolutionShell { .. } => false,
+            GeometryShape::CurvedShell { .. }
+            | GeometryShape::RevolutionShell { .. }
+            | GeometryShape::SquareJarShell { .. } => false,
             GeometryShape::CanyonTerrain {
                 floor_z,
                 valley_half_width_y,
@@ -389,7 +404,9 @@ impl GeometryShape {
                 }
                 self.quadrature_4x4x4(center, dx)
             }
-            GeometryShape::CurvedShell { .. } | GeometryShape::RevolutionShell { .. } => 0.0,
+            GeometryShape::CurvedShell { .. }
+            | GeometryShape::RevolutionShell { .. }
+            | GeometryShape::SquareJarShell { .. } => 0.0,
             GeometryShape::CanyonTerrain {
                 floor_z,
                 valley_half_width_y,
@@ -558,6 +575,23 @@ impl GeometryShape {
                         [center_xy[0] + r_max, center_xy[1] + r_max, z_max],
                     )
                 }
+            }
+            GeometryShape::SquareJarShell {
+                center_xy,
+                z_bottom,
+                body_half_width,
+                body_height,
+                shoulder_height,
+                neck_radius,
+                neck_height,
+                ..
+            } => {
+                let r_max = body_half_width.max(*neck_radius);
+                let z_top = z_bottom + body_height + shoulder_height + neck_height;
+                (
+                    [center_xy[0] - r_max, center_xy[1] - r_max, *z_bottom],
+                    [center_xy[0] + r_max, center_xy[1] + r_max, z_top],
+                )
             }
             GeometryShape::CanyonTerrain {
                 floor_z,
@@ -1238,6 +1272,155 @@ fn build_revolution_shell_mesh(
     (world_pos, tris, tri_fdirs, uvs, nom_area)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_square_jar_shell_mesh(
+    center_xy: [f32; 2],
+    z_bottom: f32,
+    body_half_width: f32,
+    body_height: f32,
+    shoulder_height: f32,
+    neck_radius: f32,
+    neck_height: f32,
+    corner_radius: f32,
+    n_perim: usize,
+    n_height: usize,
+) -> (Vec<[f32; 3]>, Vec<[usize; 3]>, Vec<[f32; 3]>, Vec<[f32; 2]>, f32) {
+    let n_t = n_perim.max(24);
+    let n_h = n_height.max(12);
+    let w = body_half_width.max(1e-3);
+    let r_neck = neck_radius.max(1e-3);
+    let frac = (corner_radius / w).clamp(0.05, 0.95);
+    let p_body = (2.0 / frac.powf(0.85)).clamp(2.5, 10.0);
+
+    // Superellipse cross-section radius for angle phi with half-width scale `s` and exponent `p`.
+    let super_xy = |phi: f32, s: f32, p: f32| -> (f32, f32) {
+        let (sp, cp) = phi.sin_cos();
+        let denom = (cp.abs().powf(p) + sp.abs().powf(p)).powf(1.0 / p).max(1e-6);
+        let r = s / denom;
+        (r * cp, r * sp)
+    };
+
+    // Build height/cross-section stations: (z, scale, p_exp)
+    // 1. Flat bottom: pole + 3 concentric rounded-square rings
+    // 2. Vertical square walls
+    // 3. Smooth C1 shoulder blending rounded square -> circular neck
+    // 4. Cylindrical open neck
+    let total_h = (body_height + shoulder_height + neck_height).max(1e-3);
+    let n_body = ((n_h as f32 * (body_height / total_h)).round() as usize).max(6);
+    let n_shoulder = ((n_h as f32 * (shoulder_height / total_h)).round() as usize).max(4);
+    let n_neck = ((n_h as f32 * (neck_height / total_h)).round() as usize).max(3);
+
+    let mut stations: Vec<(f32, f32, f32)> = Vec::new();
+    stations.push((z_bottom, 0.0, p_body));
+    for k in 1..=3 {
+        let frac_r = k as f32 / 3.0;
+        stations.push((z_bottom, w * frac_r, p_body));
+    }
+    for k in 1..=n_body {
+        let t = k as f32 / n_body as f32;
+        stations.push((z_bottom + t * body_height, w, p_body));
+    }
+    for k in 1..=n_shoulder {
+        let t = k as f32 / n_shoulder as f32;
+        let u = t * t * (3.0 - 2.0 * t); // C1 smoothstep
+        let z = z_bottom + body_height + t * shoulder_height;
+        let s = w + u * (r_neck - w);
+        let p = p_body + u * (2.0 - p_body);
+        stations.push((z, s, p));
+    }
+    for k in 1..=n_neck {
+        let t = k as f32 / n_neck as f32;
+        let z = z_bottom + body_height + shoulder_height + t * neck_height;
+        stations.push((z, r_neck, 2.0));
+    }
+
+    let m = stations.len() - 1;
+    let mut world_pos = Vec::new();
+    let mut uvs = Vec::new();
+    let mut ring_idx: Vec<Vec<usize>> = Vec::with_capacity(stations.len());
+
+    for (j, &(z_j, s_j, p_j)) in stations.iter().enumerate() {
+        let v_uv = j as f32 / m as f32;
+        if s_j <= 1e-6 {
+            let vid = world_pos.len();
+            world_pos.push([center_xy[0], center_xy[1], z_j]);
+            uvs.push([0.5, v_uv]);
+            ring_idx.push(vec![vid]);
+        } else {
+            let mut row = Vec::with_capacity(n_t);
+            for i in 0..n_t {
+                let u_uv = i as f32 / n_t as f32;
+                let phi = u_uv * 2.0 * std::f32::consts::PI;
+                let (lx, ly) = super_xy(phi, s_j, p_j);
+                let vid = world_pos.len();
+                world_pos.push([center_xy[0] + lx, center_xy[1] + ly, z_j]);
+                uvs.push([u_uv, v_uv]);
+                row.push(vid);
+            }
+            ring_idx.push(row);
+        }
+    }
+
+    let mut tris = Vec::new();
+    let mut tri_fdirs = Vec::new();
+    let orient = |verts: &[[f32; 3]], a: usize, b: usize, c: usize, hint: [f32; 3]| -> [usize; 3] {
+        let nrm = cross3(sub3(verts[b], verts[a]), sub3(verts[c], verts[a]));
+        if dot3(nrm, hint) >= 0.0 {
+            [a, b, c]
+        } else {
+            [a, c, b]
+        }
+    };
+
+    for j in 0..m {
+        let (z0, s0, _) = stations[j];
+        let (z1, s1, _) = stations[j + 1];
+        let dz = z1 - z0;
+        let ds = s1 - s0;
+        let row0 = &ring_idx[j];
+        let row1 = &ring_idx[j + 1];
+
+        if row0.len() == 1 && row1.len() == n_t {
+            let p0 = row0[0];
+            for i in 0..n_t {
+                let i_next = (i + 1) % n_t;
+                let phi = ((i as f32 + 0.5) / n_t as f32) * 2.0 * std::f32::consts::PI;
+                let (sp, cp) = phi.sin_cos();
+                tris.push(orient(&world_pos, p0, row1[i], row1[i_next], [0.0, 0.0, -1.0]));
+                tri_fdirs.push([-sp, cp, 0.0]);
+            }
+        } else if row0.len() == n_t && row1.len() == n_t {
+            for i in 0..n_t {
+                let i_next = (i + 1) % n_t;
+                let phi = ((i as f32 + 0.5) / n_t as f32) * 2.0 * std::f32::consts::PI;
+                let (sp, cp) = phi.sin_cos();
+                let hint = if dz.abs() < 1e-6 {
+                    [0.0, 0.0, -1.0]
+                } else {
+                    [dz * cp, dz * sp, -ds]
+                };
+                let a = row0[i];
+                let b = row0[i_next];
+                let c = row1[i_next];
+                let d = row1[i];
+                if (i + j) % 2 == 0 {
+                    tris.push(orient(&world_pos, a, b, c, hint));
+                    tris.push(orient(&world_pos, a, c, d, hint));
+                } else {
+                    tris.push(orient(&world_pos, a, b, d, hint));
+                    tris.push(orient(&world_pos, b, c, d, hint));
+                }
+                tri_fdirs.push([-sp, cp, 0.0]);
+                tri_fdirs.push([-sp, cp, 0.0]);
+            }
+        }
+    }
+
+    let perim_est = 8.0 * w;
+    let nom_area = (perim_est / n_t as f32) * (total_h / n_h as f32);
+    (world_pos, tris, tri_fdirs, uvs, nom_area)
+}
+
 pub fn sample_shell_solid_into(
     body: &SolidBodySpec,
     mat_id: i32,
@@ -1358,6 +1541,46 @@ pub fn sample_shell_solid_into(
             let q0 = euler_to_mat3(body.orientation_euler_xyz);
             let (world_pos, tris_raw, tri_fdirs, _uvs, nom_area) =
                 build_revolution_shell_mesh(*center_xy, profile_zr, *n_theta, *n_meridian);
+            finalize_shell_surface_into(
+                body,
+                mat_id,
+                &world_pos,
+                &tris_raw,
+                &tri_fdirs,
+                nom_area,
+                *hyd_len,
+                q0,
+                host,
+                q0_list,
+                shell,
+            );
+        }
+        GeometryShape::SquareJarShell {
+            center_xy,
+            z_bottom,
+            body_half_width,
+            body_height,
+            shoulder_height,
+            neck_radius,
+            neck_height,
+            corner_radius,
+            n_perim,
+            n_height,
+            hyd_len,
+        } => {
+            let q0 = euler_to_mat3(body.orientation_euler_xyz);
+            let (world_pos, tris_raw, tri_fdirs, _uvs, nom_area) = build_square_jar_shell_mesh(
+                *center_xy,
+                *z_bottom,
+                *body_half_width,
+                *body_height,
+                *shoulder_height,
+                *neck_radius,
+                *neck_height,
+                *corner_radius,
+                *n_perim,
+                *n_height,
+            );
             finalize_shell_surface_into(
                 body,
                 mat_id,
@@ -1679,6 +1902,38 @@ pub fn generate_shape_surface_mesh(
                     .collect();
                 uvs = uv;
             }
+        }
+        GeometryShape::SquareJarShell {
+            center_xy,
+            z_bottom,
+            body_half_width,
+            body_height,
+            shoulder_height,
+            neck_radius,
+            neck_height,
+            corner_radius,
+            n_perim,
+            n_height,
+            ..
+        } => {
+            let (vp, tr, _, uv, _) = build_square_jar_shell_mesh(
+                *center_xy,
+                *z_bottom,
+                *body_half_width,
+                *body_height,
+                *shoulder_height,
+                *neck_radius,
+                *neck_height,
+                *corner_radius,
+                *n_perim,
+                *n_height,
+            );
+            verts = vp;
+            tris = tr
+                .into_iter()
+                .map(|[a, b, c]| [a as u32, b as u32, c as u32])
+                .collect();
+            uvs = uv;
         }
         GeometryShape::CylindricalRingWithArch {
             center_xy,
