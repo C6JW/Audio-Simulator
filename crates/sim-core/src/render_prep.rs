@@ -37,12 +37,36 @@ pub struct PreparedRenderExporter {
 }
 
 pub fn classify_material_preset(body: &SolidBodySpec) -> &'static str {
+    let mname = body.material.name.to_ascii_lowercase();
+    let bname = body.name.to_ascii_lowercase();
     if body.is_kinematic_rigid {
-        "boot_sole"
+        if mname.contains("bronze") || bname.contains("clapper") {
+            "bell_bronze"
+        } else {
+            "boot_sole"
+        }
+    } else if mname.contains("glass")
+        || mname.contains("crystal")
+        || bname.contains("glass")
+        || bname.contains("jar")
+    {
+        "glass"
+    } else if mname.contains("bronze") || bname.contains("bell") || bname.contains("chime") {
+        "bell_bronze"
     } else if body.material.is_shell && body.material.wetness > 0.1 {
         "wet_leaf"
     } else if body.material.is_shell {
-        "cellulose_paper"
+        if body.material.e1 > 5.0e10 {
+            "structural_steel"
+        } else {
+            "cellulose_paper"
+        }
+    } else if mname.contains("concrete")
+        || bname.contains("canyon")
+        || bname.contains("ground")
+        || bname.contains("terrain")
+    {
+        "concrete"
     } else if body.material.is_rigid_static {
         "granite_stone"
     } else if body.material.e1 > 5.0e10 {
@@ -225,12 +249,31 @@ impl PreparedRenderExporter {
             });
         }
 
-        let water_bounds = if rcfg.export_fluid_isosurface && engine.levels.len() >= 2 {
-            let s = &engine.levels[engine.levels.len() - 1].spec;
-            Some((
-                [-0.0096, -0.0096, s.oz],
-                [0.0096, 0.0096, s.oz + (s.nz as f32) * s.dx],
-            ))
+        let water_bounds = if rcfg.export_fluid_isosurface {
+            if engine.scene.name == "water_drop_plop" && engine.levels.len() >= 2 {
+                let s = &engine.levels[engine.levels.len() - 1].spec;
+                Some((
+                    [-0.0096, -0.0096, s.oz],
+                    [0.0096, 0.0096, s.oz + (s.nz as f32) * s.dx],
+                ))
+            } else {
+                engine
+                    .levels
+                    .iter()
+                    .rev()
+                    .find(|l| l.alpha.is_some())
+                    .map(|l| {
+                        let s = &l.spec;
+                        (
+                            [s.ox, s.oy, s.oz],
+                            [
+                                s.ox + (s.nx as f32) * s.dx,
+                                s.oy + (s.ny as f32) * s.dx,
+                                s.oz + (s.nz as f32) * s.dx,
+                            ],
+                        )
+                    })
+            }
         } else {
             None
         };
@@ -339,111 +382,147 @@ impl PreparedRenderExporter {
             }
         }
 
-        if rcfg.export_fluid_isosurface && engine.levels.len() >= 2 {
-            let l2 = &engine.levels[engine.levels.len() - 1];
-            let l1 = &engine.levels[engine.levels.len() - 2];
-            if let (Some(a2_buf), Some(a1_buf)) = (&l2.alpha, &l1.alpha) {
-            let alpha_l2 = a2_buf.to_vec()?;
-            let alpha_l1 = a1_buf.to_vec()?;
+        if rcfg.export_fluid_isosurface {
+            if engine.scene.name == "water_drop_plop" && engine.levels.len() >= 2 {
+                let l2 = &engine.levels[engine.levels.len() - 1];
+                let l1 = &engine.levels[engine.levels.len() - 2];
+                if let (Some(a2_buf), Some(a1_buf)) = (&l2.alpha, &l1.alpha) {
+                    let alpha_l2 = a2_buf.to_vec()?;
+                    let alpha_l1 = a1_buf.to_vec()?;
 
-            let cnx = 96usize;
-            let cny = 96usize;
-            let cnz = l2.spec.nz;
-            let dx = l2.spec.dx;
-            let origin = [-0.0096_f32, -0.0096_f32, l2.spec.oz];
-            let off_i = ((l2.spec.ox - origin[0]) / dx).round() as isize;
-            let off_j = ((l2.spec.oy - origin[1]) / dx).round() as isize;
+                    let cnx = 96usize;
+                    let cny = 96usize;
+                    let cnz = l2.spec.nz;
+                    let dx = l2.spec.dx;
+                    let origin = [-0.0096_f32, -0.0096_f32, l2.spec.oz];
+                    let off_i = ((l2.spec.ox - origin[0]) / dx).round() as isize;
+                    let off_j = ((l2.spec.oy - origin[1]) / dx).round() as isize;
 
-            let nxp1 = l1.nxp;
-            let nyp1 = l1.nyp;
-            let nzp1 = l1.nzp;
-            let nxp2 = l2.nxp;
-            let nyp2 = l2.nyp;
-            let h1 = l1.halo as f32;
-            let h2 = l2.halo;
+                    let nxp1 = l1.nxp;
+                    let nyp1 = l1.nyp;
+                    let nzp1 = l1.nzp;
+                    let nxp2 = l2.nxp;
+                    let nyp2 = l2.nyp;
+                    let h1 = l1.halo as f32;
+                    let h2 = l2.halo;
 
-            let sample_l1 = |x: f32, y: f32, z: f32| -> f32 {
-                let fx = ((x - l1.spec.ox) / l1.spec.dx - 0.5 + h1).clamp(0.0, (nxp1 - 1) as f32);
-                let fy = ((y - l1.spec.oy) / l1.spec.dx - 0.5 + h1).clamp(0.0, (nyp1 - 1) as f32);
-                let fz = ((z - l1.spec.oz) / l1.spec.dx - 0.5 + h1).clamp(0.0, (nzp1 - 1) as f32);
-                let i0 = (fx.floor() as usize).min(nxp1 - 2);
-                let j0 = (fy.floor() as usize).min(nyp1 - 2);
-                let k0 = (fz.floor() as usize).min(nzp1 - 2);
-                let tx = (fx - i0 as f32).clamp(0.0, 1.0);
-                let ty = (fy - j0 as f32).clamp(0.0, 1.0);
-                let tz = (fz - k0 as f32).clamp(0.0, 1.0);
-                let mut acc = 0.0f32;
-                for dk in 0..=1 {
-                    let wz = if dk == 1 { tz } else { 1.0 - tz };
-                    for dj in 0..=1 {
-                        let wy = if dj == 1 { ty } else { 1.0 - ty };
-                        for di in 0..=1 {
-                            let wx = if di == 1 { tx } else { 1.0 - tx };
-                            let cid = (i0 + di) + nxp1 * ((j0 + dj) + nyp1 * (k0 + dk));
-                            acc += wx * wy * wz * alpha_l1[cid];
+                    let sample_l1 = |x: f32, y: f32, z: f32| -> f32 {
+                        let fx = ((x - l1.spec.ox) / l1.spec.dx - 0.5 + h1)
+                            .clamp(0.0, (nxp1 - 1) as f32);
+                        let fy = ((y - l1.spec.oy) / l1.spec.dx - 0.5 + h1)
+                            .clamp(0.0, (nyp1 - 1) as f32);
+                        let fz = ((z - l1.spec.oz) / l1.spec.dx - 0.5 + h1)
+                            .clamp(0.0, (nzp1 - 1) as f32);
+                        let i0 = (fx.floor() as usize).min(nxp1 - 2);
+                        let j0 = (fy.floor() as usize).min(nyp1 - 2);
+                        let k0 = (fz.floor() as usize).min(nzp1 - 2);
+                        let tx = (fx - i0 as f32).clamp(0.0, 1.0);
+                        let ty = (fy - j0 as f32).clamp(0.0, 1.0);
+                        let tz = (fz - k0 as f32).clamp(0.0, 1.0);
+                        let mut acc = 0.0f32;
+                        for dk in 0..=1 {
+                            let wz = if dk == 1 { tz } else { 1.0 - tz };
+                            for dj in 0..=1 {
+                                let wy = if dj == 1 { ty } else { 1.0 - ty };
+                                for di in 0..=1 {
+                                    let wx = if di == 1 { tx } else { 1.0 - tx };
+                                    let cid = (i0 + di) + nxp1 * ((j0 + dj) + nyp1 * (k0 + dk));
+                                    acc += wx * wy * wz * alpha_l1[cid];
+                                }
+                            }
+                        }
+                        acc
+                    };
+
+                    let mut comp_alpha = vec![0.0f32; cnx * cny * cnz];
+                    for k in 0..cnz {
+                        let z = origin[2] + (k as f32 + 0.5) * dx;
+                        for j in 0..cny {
+                            let y = origin[1] + (j as f32 + 0.5) * dx;
+                            let lj = j as isize - off_j;
+                            for i in 0..cnx {
+                                let x = origin[0] + (i as f32 + 0.5) * dx;
+                                let li = i as isize - off_i;
+                                let a_val = if li >= 0
+                                    && li < l2.spec.nx as isize
+                                    && lj >= 0
+                                    && lj < l2.spec.ny as isize
+                                {
+                                    let d_edge = li
+                                        .min(l2.spec.nx as isize - 1 - li)
+                                        .min(lj)
+                                        .min(l2.spec.ny as isize - 1 - lj);
+                                    let cid2 = (li as usize + h2)
+                                        + nxp2 * ((lj as usize + h2) + nyp2 * (k + h2));
+                                    let a_l2 = alpha_l2[cid2];
+                                    if d_edge >= 2 {
+                                        a_l2
+                                    } else {
+                                        let a_l1 = sample_l1(x, y, z);
+                                        let w = if d_edge == 1 { 0.67 } else { 0.33 };
+                                        w * a_l2 + (1.0 - w) * a_l1
+                                    }
+                                } else {
+                                    sample_l1(x, y, z)
+                                };
+                                comp_alpha[i + cnx * (j + cny * k)] = a_val;
+                            }
                         }
                     }
-                }
-                acc
-            };
 
-            let mut comp_alpha = vec![0.0f32; cnx * cny * cnz];
-            for k in 0..cnz {
-                let z = origin[2] + (k as f32 + 0.5) * dx;
-                for j in 0..cny {
-                    let y = origin[1] + (j as f32 + 0.5) * dx;
-                    let lj = j as isize - off_j;
-                    for i in 0..cnx {
-                        let x = origin[0] + (i as f32 + 0.5) * dx;
-                        let li = i as isize - off_i;
-                        let a_val = if li >= 0
-                            && li < l2.spec.nx as isize
-                            && lj >= 0
-                            && lj < l2.spec.ny as isize
-                        {
-                            let d_edge = li
-                                .min(l2.spec.nx as isize - 1 - li)
-                                .min(lj)
-                                .min(l2.spec.ny as isize - 1 - lj);
-                            let cid2 = (li as usize + h2)
-                                + nxp2 * ((lj as usize + h2) + nyp2 * (k + h2));
-                            let a_l2 = alpha_l2[cid2];
-                            if d_edge >= 2 {
-                                a_l2
-                            } else {
-                                let a_l1 = sample_l1(x, y, z);
-                                let w = if d_edge == 1 { 0.67 } else { 0.33 };
-                                w * a_l2 + (1.0 - w) * a_l1
-                            }
-                        } else {
-                            sample_l1(x, y, z)
-                        };
-                        comp_alpha[i + cnx * (j + cny * k)] = a_val;
+                    let (verts, tris) = extract_surface_nets_isosurface(
+                        &comp_alpha,
+                        cnx,
+                        cny,
+                        cnz,
+                        origin,
+                        dx,
+                        0.5,
+                        true,
+                        2,
+                    );
+                    let path = rcfg
+                        .frames_dir
+                        .join(format!("frame_{frame_idx:04}_water.ply"));
+                    write_ply_mesh(path, &verts, &tris, None, None)?;
+                }
+            } else if let Some(lvl) = engine.levels.iter().rev().find(|l| l.alpha.is_some()) {
+                if let Some(ref a_buf) = lvl.alpha {
+                    let alpha_full = a_buf.to_vec()?;
+                    let h = lvl.halo;
+                    let nx = lvl.spec.nx;
+                    let ny = lvl.spec.ny;
+                    let nz = lvl.spec.nz;
+                    let mut interior = vec![0.0f32; nx * ny * nz];
+                    for k in 0..nz {
+                        for j in 0..ny {
+                            let dst_row = nx * (j + ny * k);
+                            let src_row = h + lvl.nxp * ((h + j) + lvl.nyp * (h + k));
+                            interior[dst_row..dst_row + nx]
+                                .copy_from_slice(&alpha_full[src_row..src_row + nx]);
+                        }
                     }
+                    let (verts, tris) = extract_surface_nets_isosurface(
+                        &interior,
+                        nx,
+                        ny,
+                        nz,
+                        [lvl.spec.ox, lvl.spec.oy, lvl.spec.oz],
+                        lvl.spec.dx,
+                        0.5,
+                        true,
+                        2,
+                    );
+                    let path = rcfg
+                        .frames_dir
+                        .join(format!("frame_{frame_idx:04}_water.ply"));
+                    write_ply_mesh(path, &verts, &tris, None, None)?;
                 }
-            }
-
-            let (verts, tris) = extract_surface_nets_isosurface(
-                &comp_alpha,
-                cnx,
-                cny,
-                cnz,
-                origin,
-                dx,
-                0.5,
-                true,
-                2,
-            );
-            let path = rcfg
-                .frames_dir
-                .join(format!("frame_{frame_idx:04}_water.ply"));
-            write_ply_mesh(path, &verts, &tris, None, None)?;
             }
         }
 
         if rcfg.export_pressure_slice {
             let l0 = &engine.levels[0];
-            if let Some(pg_buf) = &l0.p_gauge {
             let h0 = l0.halo;
             let nx = l0.spec.nx;
             let ny = l0.spec.ny;
@@ -453,32 +532,69 @@ impl PreparedRenderExporter {
             let k_idx = h0 + k_rel;
             let actual_z = l0.spec.oz + (k_rel as f32 + 0.5) * l0.spec.dx;
 
-            let p_g = pg_buf.to_vec()?;
             let mut slice = vec![0.0f32; nx * ny];
             let mut max_abs_p = 0.0f32;
-            for j in 0..ny {
-                for i in 0..nx {
-                    let cid = (h0 + i) + l0.nxp * ((h0 + j) + l0.nyp * k_idx);
-                    let v = p_g[cid];
-                    max_abs_p = max_abs_p.max(v.abs());
-                    slice[i + nx * j] = v;
+            let mut wrote_slice = false;
+
+            if let Some(pg_buf) = &l0.p_gauge {
+                let p_g = pg_buf.to_vec()?;
+                for j in 0..ny {
+                    for i in 0..nx {
+                        let cid = (h0 + i) + l0.nxp * ((h0 + j) + l0.nyp * k_idx);
+                        let v = p_g[cid];
+                        max_abs_p = max_abs_p.max(v.abs());
+                        slice[i + nx * j] = v;
+                    }
                 }
+                wrote_slice = true;
+            } else if let (
+                Some(rho_buf),
+                Some(mx_buf),
+                Some(my_buf),
+                Some(mz_buf),
+                Some(ene_buf),
+            ) = (&l0.u_rho, &l0.u_mx, &l0.u_my, &l0.u_mz, &l0.u_ene)
+            {
+                let rho_h = rho_buf.to_vec()?;
+                let mx_h = mx_buf.to_vec()?;
+                let my_h = my_buf.to_vec()?;
+                let mz_h = mz_buf.to_vec()?;
+                let ene_h = ene_buf.to_vec()?;
+                let gm1 = (engine.fluid_const.gamma_a - 1.0) as f32;
+                let p0 = engine.fluid_const.p0 as f32;
+                for j in 0..ny {
+                    for i in 0..nx {
+                        let cid = (h0 + i) + l0.nxp * ((h0 + j) + l0.nyp * k_idx);
+                        let rho = rho_h[cid].max(1e-6);
+                        let mx = mx_h[cid];
+                        let my = my_h[cid];
+                        let mz = mz_h[cid];
+                        let ke = 0.5 * (mx * mx + my * my + mz * mz) / rho;
+                        let p_abs = (gm1 * (ene_h[cid] - ke)).max(1.0);
+                        let dp = p_abs - p0;
+                        max_abs_p = max_abs_p.max(dp.abs());
+                        slice[i + nx * j] = dp;
+                    }
+                }
+                wrote_slice = true;
             }
-            self.pslice_max_abs_p = self.pslice_max_abs_p.max(max_abs_p);
-            let path = rcfg
-                .frames_dir
-                .join(format!("frame_{frame_idx:04}_pslice.bin"));
-            write_pressure_slice_f32(
-                path,
-                nx,
-                ny,
-                l0.spec.ox,
-                l0.spec.oy,
-                l0.spec.dx,
-                actual_z,
-                max_abs_p,
-                &slice,
-            )?;
+
+            if wrote_slice {
+                self.pslice_max_abs_p = self.pslice_max_abs_p.max(max_abs_p);
+                let path = rcfg
+                    .frames_dir
+                    .join(format!("frame_{frame_idx:04}_pslice.bin"));
+                write_pressure_slice_f32(
+                    path,
+                    nx,
+                    ny,
+                    l0.spec.ox,
+                    l0.spec.oy,
+                    l0.spec.dx,
+                    actual_z,
+                    max_abs_p,
+                    &slice,
+                )?;
             }
         }
 

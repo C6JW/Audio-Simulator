@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use sim_cuda::ffi::*;
@@ -10,8 +10,9 @@ use sim_cuda::{
     SimReduceMetricsGpu, VramBudgetManager, DEFAULT_VRAM_CAP_BYTES,
 };
 use sim_io::{
-    prepare_probe_wav_signal_f64, write_probe_wav_f32_with_gain, write_telemetry_json,
-    write_timeseries_csv, RunTelemetry, TimeSeriesRow,
+    mux_realtime_video_with_audio, mux_video_with_audio, prepare_probe_wav_signal_f64,
+    render_frames_with_blender, write_probe_wav_f32_with_gain, write_stereo_wav_f32,
+    write_telemetry_json, write_timeseries_csv, RunTelemetry, TimeSeriesRow, VideoRenderOptions,
 };
 use thiserror::Error;
 
@@ -22,6 +23,37 @@ use crate::geometry::{
 use crate::render_prep::PreparedRenderExporter;
 use crate::scene::Scene;
 use crate::units::AIR_C;
+
+/// Format a duration in seconds into a concise human-readable string (`14.2s`, `4m 08s`, `1h 23m 05s`).
+pub fn format_duration_hms(secs: f64) -> String {
+    if !secs.is_finite() || secs <= 0.0 {
+        return "0.0s".to_string();
+    }
+    if secs < 60.0 {
+        return format!("{secs:.1}s");
+    }
+    let total = secs.round() as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}h {m:02}m {s:02}s")
+    } else {
+        format!("{m}m {s:02}s")
+    }
+}
+
+fn is_audio_only_override() -> bool {
+    for var in ["AUDIO_SIM_NO_VIDEO", "AUDIO_SIM_AUDIO_ONLY"] {
+        if let Ok(val) = std::env::var(var) {
+            let v = val.trim().to_ascii_lowercase();
+            if v == "1" || v == "true" || v == "yes" {
+                return true;
+            }
+        }
+    }
+    std::env::args().any(|a| a == "--audio-only" || a == "--no-video")
+}
 
 #[inline]
 fn splitmix64(mut x: u64) -> u64 {
@@ -84,6 +116,8 @@ pub enum EngineError {
     Audio(#[from] sim_io::AudioIoError),
     #[error("Render export error: {0}")]
     RenderExport(#[from] sim_io::RenderExportError),
+    #[error("Video pipeline error: {0}")]
+    Video(#[from] sim_io::VideoPipelineError),
     #[error("Invalid scene configuration: {0}")]
     InvalidScene(String),
 }
@@ -115,6 +149,13 @@ pub struct SimRunConfig {
     pub cfl_safety: f64,
     pub print_progress: bool,
     pub render_export: Option<RenderExportConfig>,
+    /// Automatically export scene frames, render with Blender Cycles, and mux an MP4 video
+    /// into `<output_dir>/videos/<scenario>.mp4` whenever `output_dir` is `Some(...)` and
+    /// `render_export` is not explicitly configured. Defaults to `true`.
+    /// Disable with `auto_video: false`, `--audio-only` / `--no-video`, or `AUDIO_SIM_NO_VIDEO=1`.
+    pub auto_video: bool,
+    /// Optional Blender / ffmpeg settings override used when `auto_video` runs.
+    pub video_options: Option<VideoRenderOptions>,
 }
 
 impl Default for SimRunConfig {
@@ -134,6 +175,8 @@ impl Default for SimRunConfig {
             cfl_safety: 0.38,
             print_progress: false,
             render_export: None,
+            auto_video: true,
+            video_options: None,
         }
     }
 }
@@ -142,6 +185,7 @@ pub struct SimRunResult {
     pub telemetry: RunTelemetry,
     pub timeseries: Vec<TimeSeriesRow>,
     pub raw_probe_buffers: Vec<Vec<f32>>,
+    pub video_path: Option<PathBuf>,
 }
 
 pub struct MultiphysicsEngine {
@@ -1756,6 +1800,66 @@ impl MultiphysicsEngine {
         Ok(())
     }
 
+    fn resolve_effective_render_config(
+        &self,
+        cfg: &SimRunConfig,
+        active_dur_s: f64,
+    ) -> (Option<RenderExportConfig>, bool) {
+        if let Some(ref rcfg) = cfg.render_export {
+            return (Some(rcfg.clone()), false);
+        }
+        if !cfg.auto_video || is_audio_only_override() {
+            return (None, false);
+        }
+        let Some(ref out_dir) = cfg.output_dir else {
+            return (None, false);
+        };
+
+        let frames_dir = out_dir
+            .join("videos")
+            .join("sim_data")
+            .join(&self.scene.name);
+        let num_frames = if active_dur_s < 0.5 {
+            90
+        } else {
+            ((active_dur_s * 30.0).round() as usize).clamp(60, 240)
+        };
+        let has_water = !self.scene.enable_compressible_euler
+            && (!self.scene.background_water.is_empty()
+                || !self.scene.dynamic_fluid.is_empty()
+                || !self.scene.fluid_inflows.is_empty()
+                || !self.scene.droplet_emitters.is_empty());
+        let export_pressure_slice = self.scene.enable_compressible_euler
+            || !self.scene.point_sources.is_empty()
+            || !self.scene.directional_sources.is_empty()
+            || (!self.has_dynamic_solids && !has_water);
+        let pressure_slice_z = if let Some(p) = self.scene.projectiles.first() {
+            p.initial_pos[2]
+        } else if let Some(b) = self.scene.blast_regions.first() {
+            b.center[2]
+        } else if let Some(s) = self.scene.point_sources.first() {
+            s.center[2]
+        } else if let Some(s) = self.scene.directional_sources.first() {
+            s.center[2]
+        } else if let Some(m) = self.scene.microphones.first() {
+            m.position[2]
+        } else {
+            let s0 = &self.levels[0].spec;
+            s0.oz + 0.5 * (s0.nz as f32) * s0.dx
+        };
+
+        (
+            Some(RenderExportConfig {
+                frames_dir,
+                num_frames,
+                export_fluid_isosurface: has_water,
+                export_pressure_slice,
+                pressure_slice_z,
+            }),
+            true,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn finalize_run_outputs(
         &self,
@@ -1772,6 +1876,8 @@ impl MultiphysicsEngine {
         total_substeps: u64,
         timeseries: Vec<TimeSeriesRow>,
         render_exporter: Option<PreparedRenderExporter>,
+        effective_render_cfg: Option<&RenderExportConfig>,
+        run_auto_video_render: bool,
     ) -> Result<SimRunResult> {
         let num_probes = self.scene.microphones.len();
         let mut raw_probe_buffers = vec![vec![0.0_f32; total_samples]; num_probes];
@@ -1837,7 +1943,8 @@ impl MultiphysicsEngine {
             }
         }
 
-        if let (Some(exp), Some(ref rcfg)) = (render_exporter, &cfg.render_export) {
+        let mut video_path: Option<PathBuf> = None;
+        if let (Some(exp), Some(rcfg)) = (render_exporter, effective_render_cfg) {
             exp.write_manifest(
                 self,
                 rcfg,
@@ -1846,6 +1953,99 @@ impl MultiphysicsEngine {
                 &probe_summaries,
                 cfg.output_dir.as_deref(),
             )?;
+
+            if run_auto_video_render {
+                if let Some(ref out_dir) = cfg.output_dir {
+                    // Prefer binaural stereo WAV when a left/right ear pair is present;
+                    // otherwise pick the primary non-hydrophone mic (falling back to mic 0).
+                    let left_idx = self
+                        .scene
+                        .microphones
+                        .iter()
+                        .position(|m| m.name.to_ascii_lowercase().contains("left"));
+                    let right_idx = self
+                        .scene
+                        .microphones
+                        .iter()
+                        .position(|m| m.name.to_ascii_lowercase().contains("right"));
+                    let video_wav_path = if let (Some(li), Some(ri)) = (left_idx, right_idx) {
+                        if li != ri {
+                            let stereo_p =
+                                out_dir.join(format!("{}_stereo.wav", self.scene.name));
+                            write_stereo_wav_f32(
+                                &stereo_p,
+                                &raw_probe_buffers[li],
+                                &raw_probe_buffers[ri],
+                                cfg.oversample_factor,
+                                cfg.sample_rate,
+                                cfg.target_wav_sample_rate,
+                                20.0,
+                            )?;
+                            Some(stereo_p)
+                        } else {
+                            probe_summaries
+                                .first()
+                                .and_then(|s| s.wav.as_ref().map(|w| PathBuf::from(&w.path)))
+                        }
+                    } else {
+                        probe_summaries
+                            .iter()
+                            .find(|s| !s.is_hydrophone && s.wav.is_some())
+                            .or_else(|| probe_summaries.iter().find(|s| s.wav.is_some()))
+                            .and_then(|s| s.wav.as_ref().map(|w| PathBuf::from(&w.path)))
+                    };
+
+                    if let Some(wav_p) = video_wav_path {
+                        let render_wall = Instant::now();
+                        let manifest_path = rcfg.frames_dir.join("manifest.json");
+                        let png_dir = out_dir
+                            .join("videos")
+                            .join("frames")
+                            .join(&self.scene.name);
+                        let mp4_path = out_dir
+                            .join("videos")
+                            .join(format!("{}.mp4", self.scene.name));
+                        let mut vopts = cfg.video_options.clone().unwrap_or_default();
+                        vopts.wav_pre_roll_s = actual_pre_roll_s;
+                        let active_dur_s = (cfg.duration_s - actual_pre_roll_s).max(1e-6);
+
+                        println!(
+                            "[{}] Rendering {} video frames with Blender Cycles ({}x{}, {} samples)...",
+                            self.scene.name, rcfg.num_frames, vopts.width, vopts.height, vopts.samples
+                        );
+                        render_frames_with_blender(&manifest_path, &png_dir, &vopts)?;
+
+                        if active_dur_s < 0.5 {
+                            mux_video_with_audio(
+                                &png_dir,
+                                &wav_p,
+                                cfg.duration_s,
+                                rcfg.num_frames,
+                                &mp4_path,
+                                &vopts,
+                            )?;
+                        } else {
+                            mux_realtime_video_with_audio(
+                                &png_dir,
+                                &wav_p,
+                                cfg.duration_s,
+                                actual_pre_roll_s,
+                                rcfg.num_frames,
+                                &mp4_path,
+                                vopts.post_roll_s,
+                            )?;
+                        }
+                        println!(
+                            "[{}] Video saved -> {} (audio: {}, render+mux: {})",
+                            self.scene.name,
+                            mp4_path.display(),
+                            wav_p.display(),
+                            format_duration_hms(render_wall.elapsed().as_secs_f64())
+                        );
+                        video_path = Some(mp4_path);
+                    }
+                }
+            }
         }
 
         let water_vol_err = if self.initial_water_volume > 1e-12 {
@@ -1900,6 +2100,7 @@ impl MultiphysicsEngine {
             telemetry,
             timeseries,
             raw_probe_buffers,
+            video_path,
         })
     }
 
@@ -2042,13 +2243,18 @@ impl MultiphysicsEngine {
             }
         }
 
-        let mut render_exporter = if let Some(ref rcfg) = cfg.render_export {
+        let (effective_render_cfg, run_auto_video_render) =
+            self.resolve_effective_render_config(cfg, active_dur_s);
+        let mut render_exporter = if let Some(ref rcfg) = effective_render_cfg {
             Some(PreparedRenderExporter::new(self, rcfg)?)
         } else {
             None
         };
         let mut next_render_frame = 0usize;
-        let total_render_frames = cfg.render_export.as_ref().map(|r| r.num_frames).unwrap_or(0);
+        let total_render_frames = effective_render_cfg
+            .as_ref()
+            .map(|r| r.num_frames)
+            .unwrap_or(0);
         let t_end_active = (active_samples.saturating_sub(1) as f64) * dt_probe;
 
         for active_idx in 0..active_samples {
@@ -2180,20 +2386,21 @@ impl MultiphysicsEngine {
                 {
                     let wall_s = wall_start.elapsed().as_secs_f64();
                     let frac = (t_active / active_dur_s.max(1e-12)).clamp(0.0, 1.0);
-                    let eta_s = if frac > 0.01 {
-                        wall_s * (1.0 - frac) / frac
+                    let wall_str = format_duration_hms(wall_s);
+                    let eta_str = if frac > 0.01 {
+                        format_duration_hms(wall_s * (1.0 - frac) / frac)
                     } else {
-                        0.0
+                        "--".to_string()
                     };
                     if cfg.water_surface_z_for_diag.is_some() {
                         println!(
-                            "[{}] t={:6.2}/{:6.2}ms ({:5.1}%) | wall={:5.1}s | ETA={:5.1}s | max|p|={:.3e}Pa | u_top={:.2}m/s | p_L2={:.3e}Pa | crater={:+.2}mm | Rb={:.3}mm | VRAM={:.1}MB",
+                            "[{}] t={:6.2}/{:6.2}ms ({:5.1}%) | wall={} | ETA={} | max|p|={:.3e}Pa | u_top={:.2}m/s | p_L2={:.3e}Pa | crater={:+.2}mm | Rb={:.3}mm | VRAM={:.1}MB",
                             self.scene.name,
                             t_now * 1e3,
                             cfg.duration_s * 1e3,
                             frac * 100.0,
-                            wall_s,
-                            eta_s,
+                            wall_str,
+                            eta_str,
                             Self::level_max_p(&m0),
                             u_top,
                             Self::level_max_p(&m_top),
@@ -2203,13 +2410,13 @@ impl MultiphysicsEngine {
                         );
                     } else {
                         println!(
-                            "[{}] t={:6.2}/{:6.2}ms ({:5.1}%) | wall={:5.1}s | ETA={:5.1}s | max|p|={:.3e}Pa | VRAM={:.1}MB",
+                            "[{}] t={:6.2}/{:6.2}ms ({:5.1}%) | wall={} | ETA={} | max|p|={:.3e}Pa | VRAM={:.1}MB",
                             self.scene.name,
                             t_now * 1e3,
                             cfg.duration_s * 1e3,
                             frac * 100.0,
-                            wall_s,
-                            eta_s,
+                            wall_str,
+                            eta_str,
                             m0.min_p.abs().max(m0.max_p.abs()),
                             (self.vram.tracked_bytes() as f64) / 1e6
                         );
@@ -2218,7 +2425,8 @@ impl MultiphysicsEngine {
                 }
             }
 
-            if let (Some(ref mut exp), Some(ref rcfg)) = (&mut render_exporter, &cfg.render_export) {
+            if let (Some(ref mut exp), Some(ref rcfg)) = (&mut render_exporter, &effective_render_cfg)
+            {
                 while next_render_frame < total_render_frames {
                     let t_target = if total_render_frames > 1 {
                         (next_render_frame as f64) * t_end_active
@@ -2586,6 +2794,8 @@ impl MultiphysicsEngine {
             total_substeps,
             timeseries,
             render_exporter,
+            effective_render_cfg.as_ref(),
+            run_auto_video_render,
         )
     }
 
@@ -2735,13 +2945,18 @@ impl MultiphysicsEngine {
             }
         }
 
-        let mut render_exporter = if let Some(ref rcfg) = cfg.render_export {
+        let (effective_render_cfg, run_auto_video_render) =
+            self.resolve_effective_render_config(cfg, active_dur_s);
+        let mut render_exporter = if let Some(ref rcfg) = effective_render_cfg {
             Some(PreparedRenderExporter::new(self, rcfg)?)
         } else {
             None
         };
         let mut next_render_frame = 0usize;
-        let total_render_frames = cfg.render_export.as_ref().map(|r| r.num_frames).unwrap_or(0);
+        let total_render_frames = effective_render_cfg
+            .as_ref()
+            .map(|r| r.num_frames)
+            .unwrap_or(0);
         let t_end_active = (active_samples.saturating_sub(1) as f64) * dt_probe;
 
         let mut kinematic_pivots: Vec<[f32; 3]> = self
@@ -2911,18 +3126,25 @@ impl MultiphysicsEngine {
                     minnaert_freq_hz: 0.0,
                 });
                 next_diag_t += cfg.telemetry_interval_s.max(1e-9);
-                if cfg.print_progress && (last_print_wall.elapsed().as_secs_f64() >= 2.0 || active_idx == 0) {
+                if cfg.print_progress
+                    && (last_print_wall.elapsed().as_secs_f64() >= 2.0 || active_idx == 0)
+                {
                     let wall_s = wall_start.elapsed().as_secs_f64();
                     let frac = (t_active / active_dur_s.max(1e-12)).clamp(0.0, 1.0);
-                    let eta_s = if frac > 0.01 { wall_s * (1.0 - frac) / frac } else { 0.0 };
+                    let wall_str = format_duration_hms(wall_s);
+                    let eta_str = if frac > 0.01 {
+                        format_duration_hms(wall_s * (1.0 - frac) / frac)
+                    } else {
+                        "--".to_string()
+                    };
                     println!(
-                        "[{}] t={:6.2}/{:6.2}ms ({:5.1}%) | wall={:5.1}s | ETA={:5.1}s | stride0={} | max|dp|={:.3e}Pa | VRAM={:.1}MB",
+                        "[{}] t={:6.2}/{:6.2}ms ({:5.1}%) | wall={} | ETA={} | stride0={} | max|dp|={:.3e}Pa | VRAM={:.1}MB",
                         self.scene.name,
                         t_now * 1e3,
                         cfg.duration_s * 1e3,
                         frac * 100.0,
-                        wall_s,
-                        eta_s,
+                        wall_str,
+                        eta_str,
                         coarse_stride,
                         max_p0,
                         (self.vram.tracked_bytes() as f64) / 1e6
@@ -2931,7 +3153,8 @@ impl MultiphysicsEngine {
                 }
             }
 
-            if let (Some(ref mut exp), Some(ref rcfg)) = (&mut render_exporter, &cfg.render_export) {
+            if let (Some(ref mut exp), Some(ref rcfg)) = (&mut render_exporter, &effective_render_cfg)
+            {
                 while next_render_frame < total_render_frames {
                     let t_target = if total_render_frames > 1 {
                         (next_render_frame as f64) * t_end_active
@@ -3479,6 +3702,8 @@ impl MultiphysicsEngine {
             total_substeps,
             timeseries,
             render_exporter,
+            effective_render_cfg.as_ref(),
+            run_auto_video_render,
         )
     }
 }

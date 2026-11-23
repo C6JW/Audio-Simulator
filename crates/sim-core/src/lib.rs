@@ -11,7 +11,8 @@ pub use diagnostics::{
     power_spectrum_hann, BubbleDiagnostic,
 };
 pub use engine::{
-    EngineError, MultiphysicsEngine, RenderExportConfig, Result, SimRunConfig, SimRunResult,
+    format_duration_hms, EngineError, MultiphysicsEngine, RenderExportConfig, Result, SimRunConfig,
+    SimRunResult,
 };
 pub use geometry::{generate_shape_surface_mesh, generate_shell_uvs, normalize3, GeometryShape};
 pub use material::{FluidParams, SolidMaterial};

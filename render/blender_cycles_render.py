@@ -4,10 +4,25 @@ import math
 import os
 import struct
 import sys
+import time
 
 import bpy
 import numpy as np
 from mathutils import Euler, Vector
+
+
+def format_duration_hms(secs):
+    if not math.isfinite(secs) or secs <= 0.0:
+        return "0.0s"
+    if secs < 60.0:
+        return f"{secs:.1f}s"
+    total = int(round(secs))
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    if h > 0:
+        return f"{h}h {m:02d}m {s:02d}s"
+    return f"{m}m {s:02d}s"
 
 
 def parse_args():
@@ -158,8 +173,8 @@ def configure_cycles_optix(width, height, samples, scenario):
         dev.use = (dev.type == "OPTIX")
     scene.cycles.device = "GPU"
 
-    if scenario == "water_drop_plop":
-        scene.cycles.samples = max(samples, 112)
+    if scenario in ("water_drop_plop", "pouring_square_jar", "pouring_wine_glass", "sinking_bell_grotto"):
+        scene.cycles.samples = max(samples, 96 if scenario != "water_drop_plop" else 112)
         scene.cycles.max_bounces = 16
         scene.cycles.diffuse_bounces = 3
         scene.cycles.glossy_bounces = 8
@@ -442,6 +457,72 @@ def make_cuvette_glass_material():
     return m
 
 
+def make_vessel_glass_material():
+    m, nt, bsdf, _ = new_mat("Mat_VesselGlass")
+    bsdf.inputs["Base Color"].default_value = (0.97, 0.99, 1.0, 1.0)
+    bsdf.inputs["Roughness"].default_value = 0.015
+    bsdf.inputs["IOR"].default_value = 1.52
+    bsdf.inputs["Transmission Weight"].default_value = 0.98
+    bsdf.inputs["Coat Weight"].default_value = 0.35
+    bsdf.inputs["Coat Roughness"].default_value = 0.01
+    return m
+
+
+def make_bronze_material():
+    m, nt, bsdf, _ = new_mat("Mat_BellBronze")
+    tc = nt.nodes.new("ShaderNodeTexCoord")
+    noise = nt.nodes.new("ShaderNodeTexNoise")
+    noise.inputs["Scale"].default_value = 55.0
+    noise.inputs["Detail"].default_value = 8.0
+    noise.inputs["Roughness"].default_value = 0.6
+    nt.links.new(tc.outputs["Object"], noise.inputs["Vector"])
+
+    ramp = nt.nodes.new("ShaderNodeValToRGB")
+    ramp.color_ramp.elements[0].position = 0.25
+    ramp.color_ramp.elements[0].color = (0.58, 0.41, 0.19, 1.0)
+    ramp.color_ramp.elements[1].position = 0.78
+    ramp.color_ramp.elements[1].color = (0.80, 0.61, 0.31, 1.0)
+    nt.links.new(noise.outputs["Fac"], ramp.inputs["Fac"])
+    nt.links.new(ramp.outputs["Color"], bsdf.inputs["Base Color"])
+
+    bsdf.inputs["Metallic"].default_value = 1.0
+    mr = nt.nodes.new("ShaderNodeMapRange")
+    mr.inputs["To Min"].default_value = 0.14
+    mr.inputs["To Max"].default_value = 0.28
+    nt.links.new(noise.outputs["Fac"], mr.inputs["Value"])
+    nt.links.new(mr.outputs["Result"], bsdf.inputs["Roughness"])
+    add_noise_bump(nt, bsdf, 140.0, 0.04, detail=6.0, tex_coord=tc.outputs["Object"])
+    return m
+
+
+def make_concrete_material():
+    m, nt, bsdf, _ = new_mat("Mat_Concrete")
+    tc = nt.nodes.new("ShaderNodeTexCoord")
+    noise = nt.nodes.new("ShaderNodeTexNoise")
+    noise.inputs["Scale"].default_value = 6.0
+    noise.inputs["Detail"].default_value = 10.0
+    noise.inputs["Roughness"].default_value = 0.72
+    nt.links.new(tc.outputs["Object"], noise.inputs["Vector"])
+
+    ramp = nt.nodes.new("ShaderNodeValToRGB")
+    ramp.color_ramp.elements[0].position = 0.25
+    ramp.color_ramp.elements[0].color = (0.20, 0.19, 0.17, 1.0)
+    ramp.color_ramp.elements[1].position = 0.80
+    ramp.color_ramp.elements[1].color = (0.42, 0.39, 0.35, 1.0)
+    nt.links.new(noise.outputs["Fac"], ramp.inputs["Fac"])
+    nt.links.new(ramp.outputs["Color"], bsdf.inputs["Base Color"])
+    bsdf.inputs["Roughness"].default_value = 0.82
+    add_noise_bump(nt, bsdf, 28.0, 0.18, detail=8.0, tex_coord=tc.outputs["Object"])
+    return m
+
+
+def make_boot_sole_material():
+    m, nt, bsdf, _ = new_mat("Mat_BootSole")
+    bsdf.inputs["Base Color"].default_value = (0.10, 0.10, 0.11, 1.0)
+    bsdf.inputs["Roughness"].default_value = 0.62
+    return m
+
+
 def make_dark_studio_floor_material(wet=False):
     m, nt, bsdf, _ = new_mat("Mat_StudioSurface")
     tc = nt.nodes.new("ShaderNodeTexCoord")
@@ -602,17 +683,20 @@ def setup_scene_camera_and_lights(manifest):
         add_area_light("Fill", (-0.22, -0.10, 0.12), (55, 0, -58), 1.1, 0.30, 0.20, (0.82, 0.90, 1.0))
         add_area_light("Rim", (0.02, 0.18, 0.14), (-52, 0, 180), 2.4, 0.28, 0.12, (1.0, 0.98, 0.95))
 
-    elif sc == "whispering_gallery":
-        setup_world_studio((0.010, 0.012, 0.016, 1.0), 0.12)
+    elif sc.startswith("whispering_gallery"):
+        r_ref = float(manifest.get("pslice_r_max", 0.36) or 0.36)
+        s = max(r_ref / 0.36, 1.0)
+        setup_world_studio((0.010, 0.012, 0.016, 1.0), 0.14)
         floor_mat = make_dark_studio_floor_material(wet=False)
-        add_box_mesh("GalleryPedestal", (-1.0, -1.0, -0.035), (1.0, 1.0, -0.015), floor_mat)
-        cam_obj.location = Vector((0.40, -0.64, 0.66))
-        cam_data.lens = 36.0
-        look_at(cam_obj, (0.0, 0.0, 0.02))
-        add_area_light("OverheadKey", (0.35, -0.35, 1.25), (18, 18, 0), 42.0, 0.9, 0.9, (1.0, 0.97, 0.93))
-        add_area_light("CoolRim", (-0.65, 0.55, 0.80), (-35, -30, 130), 22.0, 0.8, 0.5, (0.80, 0.90, 1.0))
+        add_box_mesh("GalleryPedestal", (-1.4 * s, -1.4 * s, -0.04 * s), (1.4 * s, 1.4 * s, -0.016 * s), floor_mat)
+        cam_obj.location = Vector((0.40 * s, -0.64 * s, 0.66 * s))
+        cam_data.lens = 35.0
+        cam_data.clip_end = max(100.0, 40.0 * s)
+        look_at(cam_obj, (0.0, 0.0, 0.03 * s))
+        add_area_light("OverheadKey", (0.35 * s, -0.35 * s, 1.25 * s), (18, 18, 0), 42.0 * s * s, 0.9 * s, 0.9 * s, (1.0, 0.97, 0.93))
+        add_area_light("CoolRim", (-0.65 * s, 0.55 * s, 0.80 * s), (-35, -30, 130), 22.0 * s * s, 0.8 * s, 0.5 * s, (0.80, 0.90, 1.0))
         for mic in manifest["microphones"]:
-            add_mic_prop(mic, scale_r=0.0045)
+            add_mic_prop(mic, scale_r=0.0045 * s)
 
     elif sc == "water_drop_plop":
         setup_world_studio((0.025, 0.032, 0.042, 1.0), 0.16)
@@ -655,6 +739,80 @@ def setup_scene_camera_and_lights(manifest):
         add_area_light("TopSoftbox", (0.0, 0.0, 0.065), (0, 0, 0), 0.24, 0.08, 0.08, (1.0, 0.99, 0.97))
         add_area_light("SideKey", (0.055, -0.015, 0.025), (65, 0, 75), 0.18, 0.05, 0.04, (0.98, 0.99, 1.0))
 
+    elif sc in ("pouring_square_jar", "pouring_wine_glass"):
+        setup_world_studio((0.022, 0.026, 0.034, 1.0), 0.22)
+        bench_mat = make_dark_studio_floor_material(wet=True)
+        add_box_mesh("StudioCounter", (-0.60, -0.60, -0.020), (0.60, 0.60, -0.0015), bench_mat)
+        # Soft luminous studio backdrop so refractive glass edges & pouring water stream pop cleanly
+        back_mat, nt, _, out = new_mat("Mat_GlassBacklight")
+        nt.links.clear()
+        em = nt.nodes.new("ShaderNodeEmission")
+        em.inputs["Color"].default_value = (0.78, 0.86, 0.96, 1.0)
+        em.inputs["Strength"].default_value = 1.35
+        nt.links.new(em.outputs["Emission"], out.inputs["Surface"])
+        bpy.ops.mesh.primitive_plane_add(size=0.90, location=(-0.12, 0.42, 0.16))
+        bp = bpy.context.active_object
+        bp.name = "GlassBacklight"
+        look_at(bp, (0.0, 0.0, 0.09))
+        bp.data.materials.append(back_mat)
+
+        if sc == "pouring_square_jar":
+            cam_obj.location = Vector((0.22, -0.34, 0.18))
+            look_at(cam_obj, (0.0, 0.0, 0.085))
+        else:
+            cam_obj.location = Vector((0.20, -0.32, 0.18))
+            look_at(cam_obj, (0.0, 0.0, 0.105))
+        cam_data.lens = 45.0
+        cam_data.clip_start = 0.002
+        add_area_light("TopKey", (0.15, -0.18, 0.48), (24, 18, 25), 14.0, 0.35, 0.30, (1.0, 0.98, 0.94))
+        add_area_light("SideRimL", (-0.36, -0.05, 0.22), (65, 0, -82), 9.0, 0.22, 0.38, (0.85, 0.93, 1.0))
+        add_area_light("SideRimR", (0.36, 0.08, 0.20), (65, 0, 102), 8.5, 0.22, 0.38, (1.0, 0.96, 0.90))
+        for mic in manifest["microphones"]:
+            add_mic_prop(mic, scale_r=0.0032)
+
+    elif sc == "sinking_bell_grotto":
+        setup_world_studio((0.014, 0.018, 0.024, 1.0), 0.18)
+        cam_obj.location = Vector((0.12, -0.175, 0.33))
+        cam_data.lens = 28.0
+        cam_data.clip_start = 0.002
+        look_at(cam_obj, (0.0, 0.0, 0.035))
+        add_area_light("GrottoShaftKey", (0.04, -0.06, 0.44), (10, 6, 0), 18.0, 0.26, 0.26, (1.0, 0.95, 0.86))
+        add_area_light("GrottoFill", (-0.14, 0.12, 0.26), (-45, -35, 135), 7.0, 0.22, 0.22, (0.72, 0.88, 1.0))
+        for mic in manifest["microphones"]:
+            add_mic_prop(mic, scale_r=0.0035)
+
+    elif sc == "supersonic_ear_flyby":
+        setup_world_studio((0.012, 0.015, 0.022, 1.0), 0.24)
+        cam_obj.location = Vector((7.8, -6.2, 5.8))
+        cam_data.lens = 30.0
+        cam_data.clip_end = 250.0
+        look_at(cam_obj, (9.8, 0.35, 1.55))
+        add_area_light("SunKey", (4.0, -8.0, 14.0), (30, 15, 18), 4500.0, 6.0, 6.0, (1.0, 0.97, 0.92))
+        add_area_light("SkyFill", (14.0, 8.0, 10.0), (-35, 20, 140), 1800.0, 8.0, 8.0, (0.78, 0.88, 1.0))
+        for mic in manifest["microphones"]:
+            add_mic_prop(mic, scale_r=0.014)
+
+    elif sc == "explosion_canyon":
+        setup_world_studio((0.020, 0.024, 0.032, 1.0), 0.32)
+        cam_obj.location = Vector((76.0, -54.0, 46.0))
+        cam_data.lens = 28.0
+        cam_data.clip_end = 2500.0
+        look_at(cam_obj, (78.0, -2.0, 2.0))
+        add_area_light("CanyonSun", (55.0, -60.0, 95.0), (32, 18, 22), 2.5e5, 35.0, 35.0, (1.0, 0.95, 0.86))
+        add_area_light("CanyonFill", (110.0, 45.0, 65.0), (-35, -20, 140), 8.0e4, 40.0, 40.0, (0.75, 0.86, 1.0))
+        for mic in manifest["microphones"]:
+            add_mic_prop(mic, scale_r=0.22)
+
+    elif sc.startswith("ballistics_"):
+        setup_world_studio((0.018, 0.022, 0.030, 1.0), 0.30)
+        cam_obj.location = Vector((160.0, -140.0, 110.0))
+        cam_data.lens = 26.0
+        cam_data.clip_end = 6000.0
+        look_at(cam_obj, (420.0, 0.0, 2.0))
+        add_area_light("RangeSun", (300.0, -200.0, 300.0), (35, 18, 20), 2.5e6, 120.0, 120.0, (1.0, 0.96, 0.88))
+        for mic in manifest["microphones"]:
+            add_mic_prop(mic, scale_r=0.60)
+
     elif sc == "rip_paper":
         setup_world_studio((0.010, 0.012, 0.016, 1.0), 0.14)
         bench_mat = make_dark_studio_floor_material(wet=False)
@@ -685,6 +843,37 @@ def setup_scene_camera_and_lights(manifest):
         add_area_light("SpecularRim", (-0.06, 0.08, 0.07), (-48, 0, 150), 0.72, 0.12, 0.06, (0.90, 0.96, 1.0))
         add_area_light("CoolFill", (-0.11, -0.05, 0.06), (60, 0, -60), 0.28, 0.14, 0.10, (0.80, 0.88, 1.0))
 
+    else:
+        # Generic studio auto-frame fallback using manifest water_bounds / microphones / sources
+        setup_world_studio((0.015, 0.018, 0.024, 1.0), 0.22)
+        pts = []
+        if manifest.get("water_bounds"):
+            wb = manifest["water_bounds"]
+            pts.append(Vector(wb[0]))
+            pts.append(Vector(wb[1]))
+        for mic in manifest.get("microphones", []):
+            pts.append(Vector(mic["position"]))
+        for src in manifest.get("point_sources", []):
+            pts.append(Vector(src["center"]))
+        if pts:
+            bmin = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
+            bmax = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
+            center = 0.5 * (bmin + bmax)
+            radius = max((bmax - bmin).length * 0.65, 0.12)
+        else:
+            center = Vector((0.0, 0.0, 0.05))
+            radius = 0.40
+        cam_obj.location = center + Vector((0.95 * radius, -1.65 * radius, 0.95 * radius))
+        cam_data.lens = 36.0
+        cam_data.clip_start = max(0.001, radius * 0.002)
+        cam_data.clip_end = max(100.0, radius * 40.0)
+        look_at(cam_obj, center)
+        add_area_light("AutoKey", tuple(center + Vector((1.1 * radius, -1.2 * radius, 1.8 * radius))), (32, 18, 24), 25.0 * radius * radius, 1.2 * radius, 1.0 * radius, (1.0, 0.97, 0.92))
+        add_area_light("AutoFill", tuple(center + Vector((-1.5 * radius, -0.6 * radius, 1.0 * radius))), (52, 0, -58), 10.0 * radius * radius, 1.4 * radius, 1.0 * radius, (0.82, 0.90, 1.0))
+        add_area_light("AutoRim", tuple(center + Vector((0.0, 1.5 * radius, 1.1 * radius))), (-48, 0, 180), 16.0 * radius * radius, 1.2 * radius, 0.7 * radius, (0.96, 0.98, 1.0))
+        for mic in manifest.get("microphones", []):
+            add_mic_prop(mic, scale_r=max(0.003, radius * 0.015))
+
     return cam_obj
 
 
@@ -701,7 +890,7 @@ def update_pull_jaw_pos(jaw_obj, coords, uvs, y_sign):
         jaw_obj.location = (float(c[0]) - 0.001, float(c[1]), float(c[2]))
 
 
-def update_pslice_mesh(pslice_obj, nx, ny, ox, oy, dx, z, vals, r_max=0.359):
+def update_pslice_mesh(pslice_obj, nx, ny, ox, oy, dx, z, vals, r_max=0.0, p_ref=250.0):
     mesh = pslice_obj.data
     if len(mesh.vertices) != nx * ny:
         xs = ox + (np.arange(nx, dtype=np.float32) + 0.5) * dx
@@ -717,13 +906,18 @@ def update_pslice_mesh(pslice_obj, nx, ny, ox, oy, dx, z, vals, r_max=0.359):
         populate_mesh_from_arrays(mesh, coords, tris, smooth=True)
         mesh.color_attributes.new(name="p_rgba", type="FLOAT_COLOR", domain="POINT")
 
-    xs = ox + (np.arange(nx, dtype=np.float32) + 0.5) * dx
-    ys = oy + (np.arange(ny, dtype=np.float32) + 0.5) * dx
-    gx, gy = np.meshgrid(xs, ys)
-    inside = (gx * gx + gy * gy) <= (r_max * r_max)
+    if r_max > 0.0:
+        xs = ox + (np.arange(nx, dtype=np.float32) + 0.5) * dx
+        ys = oy + (np.arange(ny, dtype=np.float32) + 0.5) * dx
+        gx, gy = np.meshgrid(xs, ys)
+        inside = ((gx * gx + gy * gy) <= (r_max * r_max)).ravel()
+    else:
+        inside = np.ones(ny * nx, dtype=bool)
 
-    # Signed asinh perceptual compression keeps both early source (~250 Pa) & late creeping waves (~15 Pa) crisp
-    norm_s = np.arcsinh(vals / 8.0) / np.arcsinh(250.0 / 8.0)
+    # Signed asinh perceptual compression adapts automatically to whispering waves, Mach cones, and blast shocks
+    p_hi = max(float(p_ref), 10.0)
+    knee = max(p_hi * 0.032, 1.0)
+    norm_s = np.arcsinh(vals / knee) / np.arcsinh(p_hi / knee)
     norm_s = np.clip(norm_s, -1.0, 1.0)
     abs_n = np.abs(norm_s)
 
@@ -737,7 +931,7 @@ def update_pslice_mesh(pslice_obj, nx, ny, ox, oy, dx, z, vals, r_max=0.359):
     rgba[neg, 0] = 1.00
     rgba[neg, 1] = 0.55
     rgba[neg, 2] = 0.08
-    alpha = np.where(inside.ravel(), np.power(abs_n.ravel(), 0.85) * 0.82, 0.0)
+    alpha = np.where(inside, np.power(abs_n.ravel(), 0.85) * 0.82, 0.0)
     rgba[:, 3] = np.clip(alpha, 0.0, 0.85)
 
     attr = mesh.color_attributes.get("p_rgba")
@@ -761,6 +955,10 @@ def main():
     mat_steel = make_steel_material("Mat_Steel", polished=False)
     mat_chrome = make_steel_material("Mat_Chrome", polished=True, base=(0.86, 0.88, 0.91, 1.0))
     mat_granite = make_granite_material()
+    mat_concrete = make_concrete_material()
+    mat_glass = make_vessel_glass_material()
+    mat_bronze = make_bronze_material()
+    mat_boot = make_boot_sole_material()
     mat_paper = make_paper_material()
     mat_water = make_water_material()
 
@@ -780,8 +978,28 @@ def main():
             obj.data.materials.append(mat_wood)
         elif preset == "structural_steel":
             obj.data.materials.append(mat_chrome if b["name"] == "sphere" else mat_steel)
+            if b.get("is_shell"):
+                sol = obj.modifiers.new(name="Solidify", type="SOLIDIFY")
+                sol.thickness = max(float(b["thickness_m"]), 0.001)
+                sol.offset = 0.0
+        elif preset == "glass":
+            obj.data.materials.append(mat_glass)
+            if b.get("is_shell"):
+                sol = obj.modifiers.new(name="Solidify", type="SOLIDIFY")
+                sol.thickness = max(float(b["thickness_m"]), 0.0018)
+                sol.offset = 0.0
+        elif preset == "bell_bronze":
+            obj.data.materials.append(mat_bronze)
+            if b.get("is_shell"):
+                sol = obj.modifiers.new(name="Solidify", type="SOLIDIFY")
+                sol.thickness = max(float(b["thickness_m"]), 0.0022)
+                sol.offset = 0.0
+        elif preset == "concrete":
+            obj.data.materials.append(mat_concrete)
         elif preset == "granite_stone":
             obj.data.materials.append(mat_granite)
+        elif preset == "boot_sole":
+            obj.data.materials.append(mat_boot)
         elif preset == "cellulose_paper":
             obj.data.materials.append(mat_paper)
             sol = obj.modifiers.new(name="Solidify", type="SOLIDIFY")
@@ -793,6 +1011,8 @@ def main():
             sol = obj.modifiers.new(name="Solidify", type="SOLIDIFY")
             sol.thickness = max(float(b["thickness_m"]), 0.00034)
             sol.offset = 0.0
+        else:
+            obj.data.materials.append(mat_steel)
 
         if b["is_static"] and b.get("rest_mesh_file"):
             p = os.path.join(frames_in_dir, b["rest_mesh_file"])
@@ -821,6 +1041,10 @@ def main():
 
     pslice_obj = None
     spark_obj = None
+    pslice_r_max = float(manifest.get("pslice_r_max", 0.0) or 0.0)
+    pslice_p_ref = float(manifest.get("pslice_max_abs_p", 0.0) or 0.0)
+    if pslice_p_ref <= 1e-6:
+        pslice_p_ref = 250.0
     if manifest.get("has_pressure_slice"):
         pmesh = bpy.data.meshes.new("Mesh_PSlice")
         pslice_obj = bpy.data.objects.new("AcousticPressureSlice", pmesh)
@@ -828,7 +1052,8 @@ def main():
         pslice_obj.data.materials.append(make_schlieren_material())
         if manifest.get("point_sources"):
             src = manifest["point_sources"][0]
-            bpy.ops.mesh.primitive_uv_sphere_add(radius=0.007, location=src["center"])
+            spark_r = max(0.007, pslice_r_max * 0.018)
+            bpy.ops.mesh.primitive_uv_sphere_add(radius=spark_r, location=src["center"])
             spark_obj = bpy.context.active_object
             spark_obj.name = "SourceSpark"
             sm, snt, _, sout = new_mat("Mat_Spark")
@@ -846,7 +1071,9 @@ def main():
         frame_indices = list(range(0, num_frames, max(1, args.frame_step)))
 
     duration_s = float(manifest["duration_s"])
-    for fidx in frame_indices:
+    t_render_start = time.monotonic()
+    total_to_render = len(frame_indices)
+    for done_idx, fidx in enumerate(frame_indices):
         t_frame = (fidx / max(1, num_frames - 1)) * duration_s
         for bidx, obj in body_objs.items():
             ply_p = os.path.join(frames_in_dir, f"frame_{fidx:04d}_body_{bidx}.ply")
@@ -865,8 +1092,12 @@ def main():
 
         if pslice_obj is not None:
             pbin = os.path.join(frames_in_dir, f"frame_{fidx:04d}_pslice.bin")
-            nx, ny, ox, oy, dx, z, _, vals = read_pslice_bin(pbin)
-            update_pslice_mesh(pslice_obj, nx, ny, ox, oy, dx, z, vals)
+            if os.path.exists(pbin):
+                nx, ny, ox, oy, dx, z, _, vals = read_pslice_bin(pbin)
+                update_pslice_mesh(
+                    pslice_obj, nx, ny, ox, oy, dx, z, vals,
+                    r_max=pslice_r_max, p_ref=pslice_p_ref,
+                )
             if spark_obj is not None and manifest.get("point_sources"):
                 src = manifest["point_sources"][0]
                 dt_s = (t_frame - src["t0_s"]) * 1000.0
@@ -880,7 +1111,21 @@ def main():
         bpy.context.scene.render.filepath = out_png
         bpy.ops.render.render(write_still=True)
 
-    print(f"Rendered {len(frame_indices)} frames for '{manifest['scenario']}' into {args.out_frames}")
+        done_cnt = done_idx + 1
+        wall_s = time.monotonic() - t_render_start
+        eta_s = (wall_s / done_cnt) * (total_to_render - done_cnt)
+        print(
+            f"[{manifest['scenario']}] Render frame {done_cnt}/{total_to_render} "
+            f"({100.0 * done_cnt / max(1, total_to_render):5.1f}%) | "
+            f"wall={format_duration_hms(wall_s)} | ETA={format_duration_hms(eta_s)}",
+            flush=True,
+        )
+
+    print(
+        f"Rendered {total_to_render} frames for '{manifest['scenario']}' into {args.out_frames} "
+        f"in {format_duration_hms(time.monotonic() - t_render_start)}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

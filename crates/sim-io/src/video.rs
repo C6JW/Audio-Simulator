@@ -90,16 +90,17 @@ fn run_blender_impl(
         cmd.arg("--only-frames").arg(joined.join(","));
     }
 
+    cmd.stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::piped());
+
     let out = cmd.output()?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let stdout = String::from_utf8_lossy(&out.stdout);
         return Err(VideoPipelineError::ProcessFailed {
             tool: "blender".to_string(),
             message: format!(
-                "exit {:?}\n--- stdout tail ---\n{}\n--- stderr tail ---\n{}",
+                "exit {:?}\n--- stderr tail ---\n{}",
                 out.status.code(),
-                tail_str(&stdout, 2000),
                 tail_str(&stderr, 2000)
             ),
         });
