@@ -1,0 +1,10 @@
+[package]
+name = "sim-cuda"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = "2.0"
+
+[build-dependencies]
+# Pure std build script invoking nvcc + ar

@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "crates/sim-cuda",
+    "crates/sim-io",
+    "crates/sim-core",
+]
+resolver = "2"
+
+[package]
+name = "audio-simulator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sim-core = { path = "crates/sim-core" }
+sim-cuda = { path = "crates/sim-cuda" }
+sim-io = { path = "crates/sim-io" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

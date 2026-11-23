@@ -1,0 +1,23 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Generated simulation output (WAV, telemetry, CSV, video)
+/output/
+
+# Local tooling state
+/.codegraph/
+.projectmem/events.jsonl
+.projectmem/watch.pid
+.projectmem/watch.log
+.projectmem/structure.json
+
+# Render scratch
+/render/frames/
+*.blend1
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
