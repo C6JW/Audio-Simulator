@@ -1,50 +1,63 @@
 # Audio Simulator
 
-A physics-driven acoustic simulator written in Rust and CUDA that synthesizes sound directly from coupled solid-fluid-fracture physics—covering rigid/elastic impacts, compressible blasts, submerged resonating objects, fluid pouring and droplets, architectural acoustics, and thin-shell tearing.
+A physics-first ground-truth acoustic simulator written in Rust and CUDA. Rather than relying on sample playback or procedural foley, sound is synthesized directly from coupled solid, fluid, fracture, and compressible shockwave physics sampled by virtual microphones.
 
-## Architecture
+## Capabilities & Solvers
 
-- **`crates/sim-core`** — Core simulation engine, scene definitions, geometry builders, material models, diagnostics, units, and render preparation (`engine.rs`, `scene.rs`, `geometry.rs`, `material.rs`, `render_prep.rs`, `diagnostics.rs`).
-- **`crates/sim-cuda`** — GPU-accelerated physics kernels and Rust FFI/VRAM management:
-  - Acoustic, adaptive mesh refinement (AMR), compressible, and multiphase fluid solvers (`fluid_acoustic.cu`, `fluid_amr.cu`, `fluid_compressible.cu`, `fluid_multiphase.cu`)
-  - Immersed-boundary fluid–structure coupling (`coupled_ib.cu`)
-  - Solid MPM and thin-shell fracture solvers (`solid_mpm.cu`, `solid_shell_fracture.cu`)
-  - Acoustic probe reduction (`probes_reduce.cu`)
-- **`crates/sim-io`** — WAV/audio export, video muxing, OBJ mesh loading, telemetry, and render scene export (`audio.rs`, `video.rs`, `obj_loader.rs`, `render_export.rs`, `telemetry.rs`).
-- **`render/blender_cycles_render.py`** — High-quality Cycles video rendering pipeline driven by exported simulation geometry and camera/scene data.
+- **Multiphase Fluids (`fluid_multiphase.cu`, `fluid_amr.cu`)** — Incompressible two-phase water/air VOF solver with adaptive mesh refinement (AMR), surface tension, and acoustic propagation.
+- **Compressible Gas Dynamics (`fluid_compressible.cu`)** — HLLC Euler solver with sliding AMR shock windows for supersonic projectiles, Mach cones, and blast waves.
+- **Coupled Fluid–Structure Interaction (`coupled_ib.cu`)** — Two-way immersed-boundary coupling between vibrating bulk/shell solids and surrounding air or water.
+- **Bulk Solids & Thin-Shell Fracture (`solid_mpm.cu`, `solid_shell_fracture.cu`)** — MPM solids, discrete Kirchhoff–Love thin shells with Zener SLS viscoelasticity, AT2 phase-field fracture, and wet capillary/lubrication contact.
+- **Virtual Acoustic Probes (`probes_reduce.cu`, `sim-io/audio.rs`)** — Air condenser and hydrophone pressure sampling on the fluid grid with linear-phase Kaiser FIR decimation.
+- **Cycles Video & Setup Export (`sim-io/video.rs`, `render/blender_cycles_render.py`)** — Automatic Blender Cycles OptiX rendering, FFmpeg audio/video muxing with silent pre-roll/post-roll buffers, and per-scene setup sheets (`*_setup.txt`).
+
+## Workspace Layout
+
+~~~text
+crates/
+  sim-core/   # MultiphysicsEngine orchestration, Scene specs, materials, geometry, diagnostics, render prep
+  sim-cuda/   # CUDA kernels (sm_120) + Rust FFI & VRAM budget tracking
+  sim-io/     # WAV DSP, PLY/isosurface export, telemetry JSON/CSV, Cycles/FFmpeg muxing, setup .txt export
+examples/     # Self-contained validation & showcase scenarios
+render/       # Blender Cycles OptiX rendering script (blender_cycles_render.py)
+assets/       # Input audio assets (e.g., whispering gallery dry speech)
+~~~
 
 ## Included Scenes (`examples/`)
 
-| Example | Description |
+| Example | Physics Modeled |
 | :--- | :--- |
-| `rip_paper` | Slow thin-shell fracture and tearing acoustics of a high-poly paper sheet |
-| `sinking_bell_grotto` | Ringing bell submerging into water inside an acoustic cavity |
-| `ballistics_and_blast` | Compressible shockwave and blast sound synthesis |
-| `drop_wood_vs_metal` | Material-dependent rigid impact acoustics |
-| `drop_on_wet_leaves` | Droplet impacts on compliant wet surfaces |
-| `rain_leaves_gallery` | Multi-drop rain scene on foliage |
-| `pouring_square_jar` / `pouring_wine_glass` | Multiphase liquid pouring and container cavity resonance |
-| `water_drop_plop` | Single water drop cavity/bubble resonance |
-| `whispering_gallery` | Architectural acoustic focusing (`assets/hall_whisper_speech.wav`) |
-| `wind_flutter_hall` | Aeroelastic flutter inside a hall |
-| `render_all_videos` | Batch video generation across scenes |
+| `rip_paper` | Slow, high-poly orthotropic cellulose thin-shell phase-field tearing |
+| `sinking_bell_grotto` | High-Q bronze bell struck in air and lowered into live VOF water |
+| `water_drop_plop` | Water droplet impact, cavity collapse, and Minnaert bubble resonance |
+| `pouring_square_jar` / `pouring_wine_glass` | Live liquid pouring into thin glass vessels with cavity resonance |
+| `ballistics_and_blast` | Supersonic projectiles, shockwaves, and canyon blast propagation |
+| `drop_wood_vs_metal` | Material-dependent rigid impact acoustics (orthotropic oak vs. steel) |
+| `drop_on_wet_leaves` / `rain_leaves_gallery` | Wet shell fracture, capillary adhesion, and rainfall on foliage |
+| `whispering_gallery` | Curved stone enclosure acoustic focusing |
+| `wind_flutter_hall` | Aeroelastic flutter driven by turbulent wind inlets |
+| `render_all_videos` | Batch Cycles video + setup sheet rendering across showcase scenes |
 
 ## Output Standard
 
-Every scene is designed to export:
-1. **A rendered video file (with synchronized physics-generated audio)** — never audio-only — including short silent pre-roll and post-roll padding so playback devices do not clip the opening transient or decaying tail.
-2. **A companion scene setup file** documenting mesh resolution, sound source coordinates/trajectories, microphone placement and directivity, camera placement, and whether the microphone is co-located with the camera.
+Every scene outputs synchronized **MP4 video** (not audio-only) into `output/videos/`:
+- `<scene>.mp4` — High-quality Cycles OptiX video with physics-simulated audio and silent pre-roll/post-roll buffers so playback devices do not clip the opening transient or decaying tail.
+- `<scene>_setup.txt` — Companion setup sheet recording mesh polycount, simulation parameters, sound source coordinates/trajectories, microphone coordinates, camera placement, and whether the microphone is co-located with the camera.
+- Telemetry (`output/<scene>_telemetry.json`, `output/<scene>_timeseries.csv`) for quantitative checks.
 
-## Building & Running
+## Prerequisites & Build
 
-> Requires a Rust toolchain, NVIDIA CUDA Toolkit (for `sim-cuda`), FFmpeg (for video/audio muxing), and Blender (for `render/blender_cycles_render.py`).
+- **Rust** (2021 edition; use `--release` for real scenes)
+- **NVIDIA CUDA Toolkit 13.x** (`/opt/cuda`, override with `CUDA_PATH`) and an NVIDIA GPU (`sm_120` in `crates/sim-cuda/build.rs`)
+- **Blender 5.x** (Cycles OptiX) and **FFmpeg / FFprobe** on `PATH`
 
-```bash
-# Run tests
+~~~sh
+cargo build --release
 cargo test --release
-
-# Run a single scene example (e.g., paper rip)
 cargo run --release --example rip_paper
-
-# Batch render all scene videos
 cargo run --release --example render_all_videos
+~~~
+
+## License
+
+Licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0-or-later)**. See [LICENSE](LICENSE) for details.
