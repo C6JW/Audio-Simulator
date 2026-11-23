@@ -13,9 +13,11 @@ Replace this placeholder with a concise description of what this project does, w
 
 ## Notes
 - Merge: feat: enhance rendering pipeline and material logic
+- New feature: add license [LICENSE]
 
 ## Key files
-- No key files logged yet.
+- `LICENSE`
+- `.projectmem/summary.md`
 
 ## Open questions
 - None logged yet.
